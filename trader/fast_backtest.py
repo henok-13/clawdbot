@@ -2,7 +2,12 @@
 Vectorised backtest engine — precomputes all indicators once,
 then walks bars using numpy arrays for speed.
 
-A full 12000-bar backtest runs in < 5 seconds per config.
+v3 enhancements over v2:
+  - H1 RSI alignment filter (RSI must confirm trend direction)
+  - H4 MACD histogram filter (macro momentum must agree)
+  - ATR quality filter (skip flat/explosive market regimes)
+  - Trailing stop after breakeven (locks in profits dynamically)
+  - Tighter candle quality + momentum thresholds
 """
 
 from __future__ import annotations
@@ -21,7 +26,7 @@ POINT = 0.01          # 1 point = $0.01
 PPL   = 100 * POINT   # $1.00 P&L per lot per point (XAU/USD 100 oz)
 
 
-# ── Pre-computed signal mask ──────────────────────────────────────────────────
+# ── Trend mask ────────────────────────────────────────────────────────────────
 
 def _precompute_trend_mask(
     m15: pd.DataFrame,
@@ -31,39 +36,48 @@ def _precompute_trend_mask(
     st_mult: float,
     session_open: int,
     session_close: int,
+    h1_rsi_bull_min: float = 50.0,
+    h1_rsi_bear_max: float = 50.0,
+    use_h4_macd: bool = False,
 ) -> np.ndarray:
     """
-    Returns an int8 array aligned to m15 index:
-      +1 = bullish confluence (H4 bull + H1 bull + in session)
-      -1 = bearish confluence
-       0 = no signal / ranging / wrong session
+    Returns int8 array aligned to m15 index:
+      +1 = bullish confluence  -1 = bearish  0 = no signal
     """
     n = len(m15)
 
-    # H1 trend: EMA stack + ADX
+    # H1 trend: EMA stack + ADX + optional RSI
     h1_e20  = ema(h1["close"], 20)
     h1_e50  = ema(h1["close"], 50)
     h1_e200 = ema(h1["close"], 200)
     h1_adx  = adx(h1, 14)
-    h1_bull = ((h1["close"] > h1_e20) & (h1_e20 > h1_e50) &
-               (h1_e50 > h1_e200) & (h1_adx > adx_min))
-    h1_bear = ((h1["close"] < h1_e20) & (h1_e20 < h1_e50) &
-               (h1_e50 < h1_e200) & (h1_adx > adx_min))
+    h1_rsi_v = rsi(h1["close"], 14)
 
-    # H4 trend: EMA20 > EMA50 + Supertrend
+    h1_bull = ((h1["close"] > h1_e20) & (h1_e20 > h1_e50) &
+               (h1_e50 > h1_e200) & (h1_adx > adx_min) &
+               (h1_rsi_v > h1_rsi_bull_min))
+    h1_bear = ((h1["close"] < h1_e20) & (h1_e20 < h1_e50) &
+               (h1_e50 < h1_e200) & (h1_adx > adx_min) &
+               (h1_rsi_v < h1_rsi_bear_max))
+
+    # H4 trend: EMA20>EMA50 + Supertrend + optional MACD histogram
     h4_e20 = ema(h4["close"], 20)
     h4_e50 = ema(h4["close"], 50)
     h4_st  = supertrend(h4, 10, st_mult)
     h4_bull = (h4["close"] > h4_e20) & (h4_e20 > h4_e50) & (h4_st == 1)
     h4_bear = (h4["close"] < h4_e20) & (h4_e20 < h4_e50) & (h4_st == -1)
 
-    # Map H1 and H4 trend onto M15 index (forward-fill, no look-ahead)
+    if use_h4_macd:
+        _, _, h4_hist = macd(h4["close"])
+        h4_bull = h4_bull & (h4_hist > 0)
+        h4_bear = h4_bear & (h4_hist < 0)
+
+    # Map H1 and H4 onto M15 (forward-fill, no look-ahead)
     h1_bull_m15 = h1_bull.reindex(m15.index, method="ffill").fillna(False)
     h1_bear_m15 = h1_bear.reindex(m15.index, method="ffill").fillna(False)
     h4_bull_m15 = h4_bull.reindex(m15.index, method="ffill").fillna(False)
     h4_bear_m15 = h4_bear.reindex(m15.index, method="ffill").fillna(False)
 
-    # Session filter
     hours = m15.index.hour
     in_session = (hours >= session_open) & (hours < session_close)
 
@@ -76,7 +90,6 @@ def _precompute_trend_mask(
 
 
 def _rolling_swing_high(highs: np.ndarray, lookback: int) -> np.ndarray:
-    """For each bar i, return the highest high over bars [i-lookback-min_age, i-min_age]."""
     n = len(highs)
     out = np.full(n, np.nan)
     for i in range(lookback, n):
@@ -92,25 +105,46 @@ def _rolling_swing_low(lows: np.ndarray, lookback: int) -> np.ndarray:
     return out
 
 
+# ── Parameters ────────────────────────────────────────────────────────────────
+
 @dataclass
 class BacktestParams:
-    adx_min: float          = 22.0
-    st_mult: float          = 3.0
-    breakout_atr_mult: float= 1.0
-    min_momentum_score: float = 0.5
-    atr_sl_mult: float      = 2.5
-    atr_tp_mult: float      = 5.0
-    atr_be_mult: float      = 1.5
-    session_open: int       = 7
-    session_close: int      = 20
-    min_body_ratio: float   = 0.35
-    cooldown_bars: int      = 20
-    swing_lookback: int     = 80   # bars to look back for swing high/low
-    swing_min_age: int      = 8    # min bars old for a swing to count
-    fib_lo: float           = 0.382
-    fib_hi: float           = 0.618
-    fib_ema_tol: float      = 0.005
+    # Trend filters
+    adx_min: float           = 25.0
+    st_mult: float           = 3.0
+    h1_rsi_bull_min: float   = 52.0   # H1 RSI must be above this for buys
+    h1_rsi_bear_max: float   = 48.0   # H1 RSI must be below this for sells
+    use_h4_macd: bool        = True   # require H4 MACD hist to agree
 
+    # Setup / entry
+    breakout_atr_mult: float  = 0.8
+    min_momentum_score: float = 1.0
+    min_body_ratio: float     = 0.40
+
+    # ATR volatility regime filter
+    atr_ratio_min: float     = 0.6    # skip if ATR < 0.6× its 50-bar avg (too flat)
+    atr_ratio_max: float     = 2.5    # skip if ATR > 2.5× avg (too explosive)
+
+    # Risk / exit
+    atr_sl_mult: float       = 2.0
+    atr_tp_mult: float       = 5.5
+    atr_be_mult: float       = 1.2    # move SL to entry when profit ≥ this × ATR
+    trail_atr_mult: float    = 0.8    # after BE, trail SL this × ATR behind price (0=off)
+
+    # Session & cooldown
+    session_open: int        = 8      # tighter: 08:00–18:00 UTC peak liquidity
+    session_close: int       = 18
+    cooldown_bars: int       = 20
+
+    # Swing levels
+    swing_lookback: int      = 80
+    swing_min_age: int       = 8
+    fib_lo: float            = 0.382
+    fib_hi: float            = 0.618
+    fib_ema_tol: float       = 0.005
+
+
+# ── Main backtest ─────────────────────────────────────────────────────────────
 
 def run(
     m15: pd.DataFrame,
@@ -133,13 +167,15 @@ def run(
     open_ = m15["open"].values
 
     atr_arr   = atr(m15, 14).values
+    # 50-bar rolling mean of ATR for volatility-regime filter
+    atr_avg_arr = pd.Series(atr_arr).rolling(50, min_periods=10).mean().values
+
     rsi_arr   = rsi(m15["close"], 14).values
     _, _, macd_hist = macd(m15["close"])
     macd_arr  = macd_hist.values
     e20_arr   = ema(m15["close"], 20).values
     body_arr  = candle_body_ratio(m15).values
 
-    # Swing high/low lookback (vectorised rolling max/min over a window)
     lb = params.swing_lookback + params.swing_min_age
     swing_h = _rolling_swing_high(high, lb)
     swing_l = _rolling_swing_low(low, lb)
@@ -150,6 +186,9 @@ def run(
         st_mult=params.st_mult,
         session_open=params.session_open,
         session_close=params.session_close,
+        h1_rsi_bull_min=params.h1_rsi_bull_min,
+        h1_rsi_bear_max=params.h1_rsi_bear_max,
+        use_h4_macd=params.use_h4_macd,
     )
 
     # ── Walk-forward simulation ───────────────────────────────────────────────
@@ -157,14 +196,14 @@ def run(
     start_bal = balance
     trades: list[dict] = []
 
-    # Open position state (only 1 at a time)
     in_trade   = False
-    t_dir      = 0          # +1 BUY / -1 SELL
+    t_dir      = 0
     t_entry    = 0.0
     t_sl       = 0.0
     t_tp       = 0.0
     t_be_trig  = 0.0
     t_be_moved = False
+    t_atr      = 0.0    # ATR at entry (used for trailing)
     last_entry = -9999
 
     for i in range(warmup, n):
@@ -184,6 +223,18 @@ def run(
                     t_sl = t_entry - POINT * 5
                     t_be_moved = True
 
+            # Trailing stop: after BE, trail SL by trail_atr_mult × ATR
+            if t_be_moved and params.trail_atr_mult > 0:
+                trail_dist = params.trail_atr_mult * t_atr
+                if t_dir == 1:
+                    new_sl = h - trail_dist
+                    if new_sl > t_sl:
+                        t_sl = new_sl
+                else:
+                    new_sl = l + trail_dist
+                    if new_sl < t_sl:
+                        t_sl = new_sl
+
             # Check TP / SL
             result = None
             cp = 0.0
@@ -201,29 +252,36 @@ def run(
                 trades.append({"pnl": round(pnl, 2), "result": result})
                 in_trade = False
 
-        # ── Guard: only one trade at a time ──────────────────────────────────
+        # ── Guards ────────────────────────────────────────────────────────────
         if in_trade:
             continue
         if (i - last_entry) < params.cooldown_bars:
             continue
         if balance < start_bal * 0.85:
-            break   # hard stop -15%
+            break
 
         d = trend[i]
         if d == 0:
             continue
 
-        # ── Signal checks (fast array lookups) ────────────────────────────────
+        # ── Signal checks ─────────────────────────────────────────────────────
         av = atr_arr[i]
         if np.isnan(av) or av <= 0:
             continue
+
+        # ATR volatility-regime filter
+        av_avg = atr_avg_arr[i]
+        if not np.isnan(av_avg) and av_avg > 0:
+            ratio = av / av_avg
+            if ratio < params.atr_ratio_min or ratio > params.atr_ratio_max:
+                continue
 
         # Candle body quality
         br = body_arr[i]
         if np.isnan(br) or br < params.min_body_ratio:
             continue
 
-        # Momentum score
+        # M15 momentum score (RSI zone + MACD histogram acceleration)
         rsi_v = rsi_arr[i]
         mh    = macd_arr[i]
         mh_p  = macd_arr[i - 1] if i > 0 else 0.0
@@ -238,35 +296,31 @@ def run(
             continue
 
         # Setup: breakout OR Fibonacci pullback
-        sh = swing_h[i]   # highest high over last `swing_lookback + min_age` bars
-        sl_v = swing_l[i]  # lowest low over same window
+        sh   = swing_h[i]
+        sl_v = swing_l[i]
         e20  = e20_arr[i]
 
         is_breakout = False
         is_pullback = False
 
         if not (np.isnan(sh) or np.isnan(sl_v)):
-            # Breakout
             if d == 1 and c > sh + params.breakout_atr_mult * av:
                 is_breakout = True
             elif d == -1 and c < sl_v - params.breakout_atr_mult * av:
                 is_breakout = True
 
-            # Fibonacci pullback
             swing_range = sh - sl_v
             if swing_range > 0 and not np.isnan(e20):
                 near_ema = abs(c - e20) / e20 < params.fib_ema_tol
                 if d == 1:
                     fib_hi_v = sh - params.fib_lo * swing_range
                     fib_lo_v = sh - params.fib_hi * swing_range
-                    bouncing  = c > o
-                    if fib_lo_v <= c <= fib_hi_v and near_ema and bouncing:
+                    if fib_lo_v <= c <= fib_hi_v and near_ema and c > o:
                         is_pullback = True
                 else:
                     fib_lo_v = sl_v + params.fib_lo * swing_range
                     fib_hi_v = sl_v + params.fib_hi * swing_range
-                    bouncing  = c < o
-                    if fib_lo_v <= c <= fib_hi_v and near_ema and bouncing:
+                    if fib_lo_v <= c <= fib_hi_v and near_ema and c < o:
                         is_pullback = True
 
         if not (is_breakout or is_pullback):
@@ -294,6 +348,7 @@ def run(
         t_dir      = d
         t_entry    = entry
         t_be_moved = False
+        t_atr      = av
         last_entry = i
 
     # Close any remaining open position at last bar

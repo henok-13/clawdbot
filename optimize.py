@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 Grid-search optimizer for the XAU/USD strategy.
-Uses the vectorised fast_backtest engine — runs 108 configs in < 2 minutes.
+Uses the vectorised fast_backtest engine.
 
 Usage:
-    python optimize.py              # optimize + print best final backtest
-    python optimize.py --seed 42   # different data seed
+    python optimize.py              # full grid search
+    python optimize.py --seed 42
     python optimize.py --bars 15000
+    python optimize.py --quick      # fast focused search
 """
 
 import argparse
@@ -22,7 +23,7 @@ from trader.fast_backtest import BacktestParams, run as fast_run
 
 FIXED_LOT = 0.30
 
-DIV = "─" * 74
+DIV = "─" * 80
 
 
 def resample_h4(m15):
@@ -32,32 +33,72 @@ def resample_h4(m15):
     }).dropna()
 
 
-def optimize(m15, h1, h4, min_trades: int = 20):
-    print(f"\n{'═'*74}")
-    print("  STRATEGY OPTIMIZER  —  XAU/USD  —  0.30 lot")
+def optimize(m15, h1, h4, min_trades: int = 15, quick: bool = False):
+    print(f"\n{'═'*80}")
+    print("  XAU/USD STRATEGY OPTIMIZER  —  0.30 lot")
     print(f"  Dataset: {len(m15)} M15 bars | {len(h1)} H1 | {len(h4)} H4")
-    print(f"{'─'*74}")
-    print(f"  {'ADX':>3} {'ST':>4} {'BO':>4} {'MOM':>4} {'SL':>4} {'TP':>4} "
-          f"{'N':>4} {'WIN%':>5} {'P/F':>5} {'AVG_W':>7} {'AVG_L':>7} {'NET P&L':>9} {'ROI':>5}")
-    print(DIV)
+    print(f"{'─'*80}")
 
-    grid = {
-        "adx_min":            [20, 25, 28],
-        "st_mult":            [2.5, 3.0],
-        "breakout_atr_mult":  [0.8, 1.2],
-        "min_momentum_score": [0.5, 1.0],
-        "atr_sl_mult":        [2.0, 2.5, 3.0],
-        "atr_tp_mult":        [3.5, 4.5, 5.5],
-    }
+    if quick:
+        # Focused search around known-good params — vary the new filter levers
+        grid = {
+            "adx_min":            [22, 25],
+            "st_mult":            [3.0],
+            "breakout_atr_mult":  [0.8, 1.0],
+            "min_momentum_score": [1.0],
+            "atr_sl_mult":        [2.0, 2.5],
+            "atr_tp_mult":        [5.0, 5.5, 6.0],
+            "h1_rsi_bull_min":    [50.0, 52.0],
+            "h1_rsi_bear_max":    [48.0, 50.0],
+            "use_h4_macd":        [True, False],
+            "atr_ratio_min":      [0.5, 0.7],
+            "trail_atr_mult":     [0.0, 0.8],
+            "min_body_ratio":     [0.40],
+        }
+    else:
+        grid = {
+            "adx_min":            [20, 25, 28],
+            "st_mult":            [2.5, 3.0],
+            "breakout_atr_mult":  [0.8, 1.2],
+            "min_momentum_score": [0.5, 1.0],
+            "atr_sl_mult":        [2.0, 2.5, 3.0],
+            "atr_tp_mult":        [4.5, 5.5, 6.5],
+            "h1_rsi_bull_min":    [50.0, 52.0],
+            "h1_rsi_bear_max":    [48.0, 50.0],
+            "use_h4_macd":        [True, False],
+            "atr_ratio_min":      [0.5, 0.7],
+            "trail_atr_mult":     [0.0, 0.8],
+            "min_body_ratio":     [0.38, 0.45],
+        }
 
     keys = list(grid.keys())
     combos = list(itertools.product(*grid.values()))
     total = len(combos)
     results = []
 
+    print(f"  {'ADX':>3} {'ST':>4} {'BO':>4} {'MOM':>4} {'SL':>4} {'TP':>4} "
+          f"{'RSI':>5} {'H4M':>4} {'TRL':>4} "
+          f"{'N':>4} {'WIN%':>5} {'P/F':>5} {'NET P&L':>9} {'ROI':>5}")
+    print(DIV)
+
     t0 = time.time()
     for idx, vals in enumerate(combos):
-        p = BacktestParams(**dict(zip(keys, vals)), atr_be_mult=vals[4] * 0.6)
+        kv = dict(zip(keys, vals))
+        p = BacktestParams(
+            adx_min=kv["adx_min"],
+            st_mult=kv["st_mult"],
+            breakout_atr_mult=kv["breakout_atr_mult"],
+            min_momentum_score=kv["min_momentum_score"],
+            atr_sl_mult=kv["atr_sl_mult"],
+            atr_tp_mult=kv["atr_tp_mult"],
+            h1_rsi_bull_min=kv["h1_rsi_bull_min"],
+            h1_rsi_bear_max=kv["h1_rsi_bear_max"],
+            use_h4_macd=kv["use_h4_macd"],
+            atr_ratio_min=kv["atr_ratio_min"],
+            trail_atr_mult=kv["trail_atr_mult"],
+            min_body_ratio=kv["min_body_ratio"],
+            atr_be_mult=kv["atr_sl_mult"] * 0.6,
+        )
         s = fast_run(m15, h1, h4, p, lot=FIXED_LOT)
 
         if s["n"] < min_trades:
@@ -66,11 +107,15 @@ def optimize(m15, h1, h4, min_trades: int = 20):
         score = s["win_rate"] * s["profit_factor"]
         results.append((score, p, s))
 
-        adx_v, st_m, bo_m, mom_s, sl_m, tp_m = vals
+        adx_v, st_m, bo_m, mom_s, sl_m, tp_m = (
+            kv["adx_min"], kv["st_mult"], kv["breakout_atr_mult"],
+            kv["min_momentum_score"], kv["atr_sl_mult"], kv["atr_tp_mult"],
+        )
+        h4m = "Y" if kv["use_h4_macd"] else "N"
         print(f"  {adx_v:>3.0f} {st_m:>4.1f} {bo_m:>4.1f} {mom_s:>4.1f} "
               f"{sl_m:>4.1f} {tp_m:>4.1f} "
+              f"{kv['h1_rsi_bull_min']:>5.0f} {h4m:>4} {kv['trail_atr_mult']:>4.1f} "
               f"{s['n']:>4} {s['win_rate']:>5.1f} {s['profit_factor']:>5.2f} "
-              f"${s['avg_win']:>6.0f} ${s['avg_loss']:>6.0f} "
               f"${s['net_pnl']:>8.2f} {s['roi']:>4.1f}%")
 
     elapsed = time.time() - t0
@@ -82,32 +127,41 @@ def optimize(m15, h1, h4, min_trades: int = 20):
 
     results.sort(key=lambda x: x[0], reverse=True)
 
-    print(f"\n{'═'*74}")
+    print(f"\n{'═'*80}")
     print("  TOP 5 CONFIGURATIONS  (ranked by win_rate × profit_factor)")
-    print(f"{'─'*74}")
+    print(f"{'─'*80}")
     print(f"  {'#':>2} {'ADX':>3} {'ST':>4} {'BO':>4} {'MOM':>4} {'SL':>4} {'TP':>4} "
+          f"{'RSI':>5} {'H4M':>4} {'TRL':>4} "
           f"{'N':>4} {'WIN%':>5} {'P/F':>5} {'NET P&L':>9} {'ROI':>5}")
     for rank, (score, p, s) in enumerate(results[:5], 1):
+        h4m = "Y" if p.use_h4_macd else "N"
         print(f"  {rank:>2} {p.adx_min:>3.0f} {p.st_mult:>4.1f} {p.breakout_atr_mult:>4.1f} "
               f"{p.min_momentum_score:>4.1f} {p.atr_sl_mult:>4.1f} {p.atr_tp_mult:>4.1f} "
+              f"{p.h1_rsi_bull_min:>5.0f} {h4m:>4} {p.trail_atr_mult:>4.1f} "
               f"{s['n']:>4} {s['win_rate']:>5.1f} {s['profit_factor']:>5.2f} "
               f"${s['net_pnl']:>8.2f} {s['roi']:>4.1f}%")
 
     best_score, best_p, best_s = results[0]
-    print(f"\n{'═'*74}")
+    print(f"\n{'═'*80}")
     print("  BEST PARAMETER SET")
-    print(f"{'─'*74}")
+    print(f"{'─'*80}")
     print(f"  ADX min              : {best_p.adx_min}")
     print(f"  Supertrend mult      : {best_p.st_mult}")
     print(f"  Breakout ATR mult    : {best_p.breakout_atr_mult}")
     print(f"  Min momentum score   : {best_p.min_momentum_score}")
+    print(f"  H1 RSI bull min      : {best_p.h1_rsi_bull_min}")
+    print(f"  H4 MACD filter       : {best_p.use_h4_macd}")
+    print(f"  ATR ratio min        : {best_p.atr_ratio_min}")
+    print(f"  Trailing ATR mult    : {best_p.trail_atr_mult}")
     print(f"  SL ATR mult          : {best_p.atr_sl_mult}")
     print(f"  TP ATR mult          : {best_p.atr_tp_mult}")
     print(f"  BE ATR mult          : {best_p.atr_be_mult:.2f}")
+    print(f"  Min body ratio       : {best_p.min_body_ratio}")
+    print(f"  Session              : {best_p.session_open}:00–{best_p.session_close}:00 UTC")
     print(f"  R:R ratio            : 1:{best_p.atr_tp_mult/best_p.atr_sl_mult:.1f}")
-    print(f"{'─'*74}")
+    print(f"{'─'*80}")
     print_stats(best_s)
-    print(f"{'═'*74}\n")
+    print(f"{'═'*80}\n")
     return best_p
 
 
@@ -122,18 +176,20 @@ def print_stats(s: dict):
     print(f"  Final equity   : ${10_000 + s['net_pnl']:,.2f}")
 
 
-def cross_validate(m15, h1, h4, best_p: BacktestParams):
-    """Run the best params on different data seeds to check robustness."""
-    print(f"\n{'═'*74}")
-    print("  CROSS-VALIDATION  —  5 different data seeds")
-    print(f"{'─'*74}")
-    print(f"  {'SEED':>5} {'N':>4} {'WIN%':>5} {'P/F':>5} {'NET P&L':>10} {'ROI':>6}")
+def cross_validate(m15, h1, h4, best_p: BacktestParams, n_seeds: int = 10):
+    """Run the best params on N different data seeds to check robustness."""
+    seeds = [7, 13, 42, 99, 123, 200, 314, 512, 777, 999][:n_seeds]
+
+    print(f"\n{'═'*80}")
+    print(f"  CROSS-VALIDATION  —  {n_seeds} seeds  (10,000 bars each)")
+    print(f"{'─'*80}")
+    print(f"  {'SEED':>5} {'N':>4} {'WIN%':>5} {'P/F':>5} {'NET P&L':>10} {'EQUITY':>12} {'ROI':>6}")
     print(DIV)
 
-    seeds = [7, 13, 42, 99, 123]
     total_n = 0
     total_pnl = 0.0
     all_wins = 0
+    profitable = 0
 
     for seed in seeds:
         m15_v = generate_xauusd(n_bars=10000, timeframe_minutes=15, seed=seed)
@@ -143,24 +199,33 @@ def cross_validate(m15, h1, h4, best_p: BacktestParams):
         total_n   += s["n"]
         total_pnl += s["net_pnl"]
         all_wins  += s["wins"]
+        if s["net_pnl"] > 0:
+            profitable += 1
+        eq = 10_000 + s["net_pnl"]
         print(f"  {seed:>5} {s['n']:>4} {s['win_rate']:>5.1f} "
-              f"{s['profit_factor']:>5.2f} ${s['net_pnl']:>9.2f} {s['roi']:>5.1f}%")
+              f"{s['profit_factor']:>5.2f} ${s['net_pnl']:>9.2f} "
+              f"${eq:>10,.2f} {s['roi']:>5.1f}%")
 
     if total_n:
-        avg_wr = all_wins / total_n * 100
+        avg_wr  = all_wins / total_n * 100
         avg_pnl = total_pnl / len(seeds)
         print(DIV)
-        print(f"  {'AVG':>5} {total_n//len(seeds):>4} {avg_wr:>5.1f}      "
-              f"     ${avg_pnl:>9.2f}")
-    print(f"{'═'*74}\n")
+        print(f"  {'AVG':>5} {total_n//len(seeds):>4} {avg_wr:>5.1f}            "
+              f"  ${avg_pnl:>9.2f} ${10_000+avg_pnl:>10,.2f}")
+        print(f"\n  Profitable seeds : {profitable}/{len(seeds)}")
+    print(f"{'═'*80}\n")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="XAU/USD Strategy Optimizer")
-    parser.add_argument("--seed",  type=int, default=7)
-    parser.add_argument("--bars",  type=int, default=12000)
-    parser.add_argument("--min-trades", type=int, default=20)
+    parser.add_argument("--seed",       type=int,  default=7)
+    parser.add_argument("--bars",       type=int,  default=12000)
+    parser.add_argument("--min-trades", type=int,  default=15)
     parser.add_argument("--no-crossval", action="store_true")
+    parser.add_argument("--seeds",      type=int,  default=10,
+                        help="Number of seeds for cross-validation (default 10)")
+    parser.add_argument("--quick",      action="store_true",
+                        help="Focused fast search around best known params")
     args = parser.parse_args()
 
     print(f"\n  Generating {args.bars} bars (seed={args.seed})…", flush=True)
@@ -168,7 +233,7 @@ if __name__ == "__main__":
     h1  = resample_to_h1(m15)
     h4  = resample_h4(m15)
 
-    best_p = optimize(m15, h1, h4, min_trades=args.min_trades)
+    best_p = optimize(m15, h1, h4, min_trades=args.min_trades, quick=args.quick)
 
     if not args.no_crossval and best_p is not None:
-        cross_validate(m15, h1, h4, best_p)
+        cross_validate(m15, h1, h4, best_p, n_seeds=args.seeds)

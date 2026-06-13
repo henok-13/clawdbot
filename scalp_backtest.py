@@ -69,7 +69,7 @@ def main() -> None:
 
     # ── Results table ─────────────────────────────────────────────────────────
     header = (
-        f"{'Seed':>4}  {'Trades':>7}  {'Trd/Day':>7}  {'Win%':>6}  "
+        f"{'Seed':>4}  {'Trades':>7}  {'Trd/Day':>7}  {'Win%':>6}  {'BE':>5}  "
         f"{'Net P&L':>10}  {'Equity':>10}  {'PF':>5}"
     )
     sep = "-" * len(header)
@@ -82,6 +82,7 @@ def main() -> None:
             f"{r['n']:>7}  "
             f"{r['trades_per_day']:>7.1f}  "
             f"{r['win_rate']:>6.1f}  "
+            f"{r['breakevens']:>5}  "
             f"${r['net_pnl']:>9,.2f}  "
             f"${r['final_balance']:>9,.2f}  "
             f"{r['profit_factor']:>5.2f}"
@@ -95,32 +96,32 @@ def main() -> None:
     arr_pnl  = np.array([r["net_pnl"]        for r in rows])
     arr_pf   = np.array([r["profit_factor"]  for r in rows])
     arr_bal  = np.array([r["final_balance"]  for r in rows])
+    arr_aw   = np.array([r["avg_win"]        for r in rows])
+    arr_al   = np.array([r["avg_loss"]       for r in rows])
+    arr_nd   = np.array([r["n_days"]         for r in rows])
 
     print()
     print("SUMMARY (10 seeds):")
     print(f"  Avg trades/day  : {arr_tpd.mean():.1f}  "
           f"(min {arr_tpd.min():.1f} / max {arr_tpd.max():.1f})")
-    print(f"  Avg win rate    : {arr_wr.mean():.1f}%")
+    print(f"  Avg win rate    : {arr_wr.mean():.1f}%  (TP hits vs decisive exits; BE excluded)")
     print(f"  Avg profit factor: {arr_pf.mean():.2f}")
+    print(f"  Avg win / loss  : +${arr_aw.mean():.2f} / -${arr_al.mean():.2f}")
     print(f"  Avg net P&L     : ${arr_pnl.mean():,.2f}  "
           f"(min ${arr_pnl.min():,.2f} / max ${arr_pnl.max():,.2f})")
 
-    # Daily and monthly estimates
-    avg_wins_day   = arr_tpd.mean() * (arr_wr.mean() / 100)
-    avg_losses_day = arr_tpd.mean() * (1 - arr_wr.mean() / 100)
-    win_net   = (PARAMS.tp_points - PARAMS.spread_points) * LOT   # $/trade
-    loss_net  = (PARAMS.sl_points + PARAMS.spread_points) * LOT   # $/trade
-    daily_pnl = avg_wins_day * win_net - avg_losses_day * loss_net
-    monthly   = daily_pnl * 22  # ~22 trading days/month
+    # Daily P&L derived directly from backtest net P&L ÷ trading days
+    daily_pnl = arr_pnl.mean() / arr_nd.mean()
+    monthly   = daily_pnl * 22
 
-    print(f"  Est. daily P&L  : ${daily_pnl:,.2f}  (at 0.50 lot)")
+    print(f"  Est. daily P&L  : ${daily_pnl:,.2f}  (at {LOT} lot)")
     print(f"  Est. monthly P&L: ${monthly:,.2f}  (22 trading days)")
     print(f"  Avg final equity: ${arr_bal.mean():,.2f}  "
           f"(ROI {(arr_bal.mean() - START_BAL) / START_BAL * 100:.1f}%)")
     print()
 
-    # Break-even win rate
-    # win_net * wr = loss_net * (1 - wr)  =>  wr = loss_net / (win_net + loss_net)
+    win_net  = (PARAMS.tp_points - PARAMS.spread_points) * LOT
+    loss_net = (PARAMS.sl_points + PARAMS.spread_points) * LOT
     be_wr = loss_net / (win_net + loss_net) * 100
     print(f"  Break-even win rate: {be_wr:.1f}%  "
           f"(TP={PARAMS.tp_points}pts, SL={PARAMS.sl_points}pts, spread={PARAMS.spread_points}pts, lot={LOT})")

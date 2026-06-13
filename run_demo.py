@@ -1,320 +1,444 @@
 #!/usr/bin/env python3
 """
-Demo runner — uses real XAU/USD market data, paper-trades on a $10,000 virtual account.
-No MetaTrader 5 installation required; runs on any OS.
+Demo runner — paper-trades on a virtual $10,000 account using real
+or synthetic XAU/USD data. Supports single backtest or parameter optimization.
 
 Usage:
-    python run_demo.py               # live paper-trading loop
-    python run_demo.py --backtest    # instant backtest on last 60 days of data
-    python run_demo.py --ticks 5     # run exactly N live ticks then exit
+    python run_demo.py --backtest              # single run with default params
+    python run_demo.py --optimize             # grid-search best params
+    python run_demo.py --ticks 5             # live paper-trading (N ticks)
 """
 
 import argparse
+import itertools
 import logging
 import os
 import sys
 import time
+from copy import deepcopy
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-# Patch the bot to use demo_connector instead of mt5_connector
-import trader.demo_connector as demo_conn
-sys.modules["trader.mt5_connector"] = demo_conn  # type: ignore[assignment]
+import trader.demo_connector as dc
+sys.modules["trader.mt5_connector"] = dc  # type: ignore[assignment]
 
-from trader import demo_connector as dc
 from trader.config import strategy_cfg as scfg, risk_cfg as rcfg  # noqa: E402
-from trader.strategy import evaluate
-from trader.indicators import ema, rsi, macd, atr, adx
-
+from trader.synthetic_data import generate_xauusd, resample_to_h1  # noqa: E402
+from trader.strategy_v2 import StrategyParams, evaluate, Signal     # noqa: E402
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,   # suppress per-bar noise during optimization
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
-DIVIDER = "─" * 62
+FIXED_LOT = 0.30          # user-requested lot size
+POINT     = 0.01          # 1 point = $0.01 for XAU/USD
+PPL       = 100 * POINT   # P&L per lot per point = $1.00
+
+DIVIDER = "─" * 66
 
 
-def print_header():
-    print(f"\n{'═'*62}")
-    print(f"  XAU/USD Algorithm Trader — DEMO / PAPER TRADING")
-    print(f"  Account balance : ${dc.DEMO_BALANCE:,.2f}")
-    print(f"  Strategy        : {scfg.trend_timeframe} trend | {scfg.timeframe} signals")
-    print(f"  TP              : {rcfg.take_profit_points} pts (${rcfg.take_profit_points*0.01:.2f})")
-    print(f"  SL              : {rcfg.stop_loss_points} pts (${rcfg.stop_loss_points*0.01:.2f})")
-    print(f"  Max lot         : {rcfg.max_lot}")
-    print(f"  Data source     : Yahoo Finance (GC=F — Gold Futures)")
-    print(f"{'═'*62}\n")
+def _resample_h4(m15: "pd.DataFrame") -> "pd.DataFrame":
+    import pandas as pd
+    return m15.resample("4h").agg({
+        "open": "first", "high": "max",
+        "low": "min", "close": "last", "volume": "sum",
+    }).dropna()
 
 
-def print_market_snapshot(m15, h1):
-    close = m15["close"]
-    e20   = ema(close, scfg.ema_fast).iloc[-1]
-    e50   = ema(close, scfg.ema_slow).iloc[-1]
-    rsi_v = rsi(close, scfg.rsi_period).iloc[-1]
-    adx_v = adx(h1, 14).iloc[-1]
-    atr_v = atr(m15, scfg.atr_period).iloc[-1]
-    price = close.iloc[-1]
+# ── Core backtest engine ──────────────────────────────────────────────────────
 
-    h1_close = h1["close"]
-    h1_e20   = ema(h1_close, scfg.ema_fast).iloc[-1]
-    h1_e50   = ema(h1_close, scfg.ema_slow).iloc[-1]
-    h1_e200  = ema(h1_close, scfg.ema_trend).iloc[-1]
+class PaperAccount:
+    def __init__(self, balance: float = 10_000.0):
+        self.start_balance = balance
+        self.balance = balance
+        self.equity  = balance
+        self.trades: list[dict] = []
+        self._open: list[dict] = []
 
-    if h1_close.iloc[-1] > h1_e20 > h1_e50 > h1_e200 and adx_v > scfg.adx_threshold:
-        trend = "BULLISH ▲"
-    elif h1_close.iloc[-1] < h1_e20 < h1_e50 < h1_e200 and adx_v > scfg.adx_threshold:
-        trend = "BEARISH ▼"
-    else:
-        trend = "RANGING  —"
+    def open_trade(self, direction: str, entry: float, sl: float,
+                   tp: float, be_trigger: float, lot: float, bar_idx: int):
+        self._open.append({
+            "direction": direction, "entry": entry,
+            "sl": sl, "tp": tp, "be_trigger": be_trigger,
+            "lot": lot, "bar_idx": bar_idx, "be_moved": False,
+        })
 
-    print(DIVIDER)
-    print(f"  Price : ${price:,.2f}    Trend : {trend}")
-    print(f"  EMA20 : {e20:.2f}   EMA50 : {e50:.2f}")
-    print(f"  RSI   : {rsi_v:.1f}          ADX   : {adx_v:.1f}    ATR : {atr_v:.2f}")
-    print(DIVIDER)
+    def update(self, bar_high: float, bar_low: float, bar_idx: int) -> None:
+        """Check each open position for SL/TP/breakeven on the current bar."""
+        closed = []
+        for pos in self._open:
+            direction = pos["direction"]
+            entry     = pos["entry"]
+            tp        = pos["tp"]
+            sl        = pos["sl"]
+            lot       = pos["lot"]
 
+            # Breakeven: move SL to entry once floating profit ≥ be_trigger
+            if not pos["be_moved"]:
+                if direction == "BUY"  and bar_high >= pos["be_trigger"]:
+                    pos["sl"] = entry + POINT * 5   # 5 pts above entry
+                    pos["be_moved"] = True
+                elif direction == "SELL" and bar_low <= pos["be_trigger"]:
+                    pos["sl"] = entry - POINT * 5
+                    pos["be_moved"] = True
 
-def print_account(account: dc.DemoAccount):
-    pnl = account.equity - dc.DEMO_BALANCE
-    pnl_sign = "+" if pnl >= 0 else ""
-    print(f"\n  💰 Equity   : ${account.equity:>10,.2f}   ({pnl_sign}${pnl:.2f})")
-    print(f"  📊 Trades   : {len(account.closed_trades)} closed | {len(account.open_positions)} open")
-    if account.closed_trades:
-        wins = sum(1 for t in account.closed_trades if t["pnl"] > 0)
-        win_rate = wins / len(account.closed_trades) * 100
-        total_pnl = sum(t["pnl"] for t in account.closed_trades)
-        print(f"  🎯 Win rate : {win_rate:.0f}%   Total realised P&L : ${total_pnl:+.2f}")
-
-
-def print_open_positions(account: dc.DemoAccount):
-    if not account.open_positions:
-        print("  No open positions.")
-        return
-    for p in account.open_positions:
-        dir_str = "BUY " if p.type == 0 else "SELL"
-        pnl_sign = "+" if p.profit >= 0 else ""
-        print(f"  [{p.ticket}] {dir_str} {p.volume}lot @ {p.price_open:.2f}  "
-              f"TP={p.tp:.2f} SL={p.sl:.2f}  P&L: {pnl_sign}${p.profit:.2f}")
-
-
-def print_closed_trades(account: dc.DemoAccount):
-    if not account.closed_trades:
-        return
-    print(f"\n  {'─'*58}")
-    print(f"  {'TICKET':<10} {'DIR':<5} {'LOT':<6} {'ENTRY':>8} {'EXIT':>8} {'P&L':>8} {'EXIT':<4}")
-    print(f"  {'─'*58}")
-    for t in account.closed_trades:
-        pnl_str = f"${t['pnl']:+.2f}"
-        print(f"  {t['ticket']:<10} {t['direction']:<5} {t['lot']:<6.2f} "
-              f"{t['open_price']:>8.2f} {t['close_price']:>8.2f} "
-              f"{pnl_str:>8} {t['reason']:<4}")
-    print(f"  {'─'*58}")
-
-
-def run_live(max_ticks: int = 0):
-    """Live paper-trading loop — runs until Ctrl-C or max_ticks."""
-    dc.connect()
-    print_header()
-    logger.info("Fetching market data…")
-
-    tick_count = 0
-    try:
-        while True:
-            m15 = dc.get_ohlcv("XAUUSD", scfg.timeframe, count=300)
-            h1  = dc.get_ohlcv("XAUUSD", scfg.trend_timeframe, count=300)
-
-            if m15 is None or h1 is None:
-                logger.warning("Data unavailable — retrying in 60s")
-                time.sleep(60)
-                continue
-
-            # Update open positions mark-to-market
-            current_price = m15["close"].iloc[-1]
-            dc._account.update_equity(current_price)
-
-            print(f"\n[Tick {tick_count+1}]  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-            print_market_snapshot(m15, h1)
-            print_account(dc._account)
-            print("\n  Open positions:")
-            print_open_positions(dc._account)
-
-            # Check guards
-            if dc.daily_loss_exceeded("XAUUSD"):
-                logger.warning("Daily loss limit hit — no new entries.")
-            elif len(dc.get_open_bot_trades("XAUUSD")) >= rcfg.max_open_trades:
-                logger.info("Max open trades reached — skipping signal check.")
+            # Check TP / SL
+            result = None
+            close_price = None
+            if direction == "BUY":
+                if bar_high >= tp:
+                    result, close_price = "TP", tp
+                elif bar_low <= pos["sl"]:
+                    result, close_price = "SL", pos["sl"]
             else:
-                sig = evaluate(m15, h1)
-                if sig:
-                    print(f"\n  *** SIGNAL: {sig.direction} {sig.entry_type} "
-                          f"strength={sig.strength:.0%} ***")
-                    print(f"  Reason: {sig.reason}")
-                    equity = dc.get_account_equity()
-                    lot = dc.calc_lot_size(rcfg.stop_loss_points, equity)
-                    dc.place_order("XAUUSD", sig.direction, lot,
-                                   rcfg.stop_loss_points, rcfg.take_profit_points,
-                                   comment=f"demo-{sig.entry_type.lower()[:2]}")
-                else:
-                    print("\n  No signal this tick.")
+                if bar_low <= tp:
+                    result, close_price = "TP", tp
+                elif bar_high >= pos["sl"]:
+                    result, close_price = "SL", pos["sl"]
 
-            if account_closed_trades := dc._account.closed_trades:
-                print("\n  Recent closed trades:")
-                print_closed_trades(dc._account)
+            if result:
+                pnl_pts = ((close_price - entry) / POINT
+                           if direction == "BUY"
+                           else (entry - close_price) / POINT)
+                pnl = pnl_pts * lot * PPL
+                self.balance += pnl
+                self.equity   = self.balance
+                self.trades.append({
+                    "direction": direction, "entry": entry,
+                    "exit": close_price, "lot": lot,
+                    "pnl": round(pnl, 2), "result": result,
+                    "bar_idx": bar_idx,
+                })
+                closed.append(pos)
 
-            tick_count += 1
-            if max_ticks and tick_count >= max_ticks:
-                break
+        for p in closed:
+            self._open.remove(p)
 
-            logger.info("Next check in 60 seconds…")
-            time.sleep(60)
+    def close_all(self, price: float, bar_idx: int):
+        for pos in list(self._open):
+            direction = pos["direction"]
+            entry = pos["entry"]
+            pnl_pts = ((price - entry) / POINT if direction == "BUY"
+                       else (entry - price) / POINT)
+            pnl = pnl_pts * pos["lot"] * PPL
+            self.balance += pnl
+            self.trades.append({
+                "direction": direction, "entry": entry,
+                "exit": price, "lot": pos["lot"],
+                "pnl": round(pnl, 2), "result": "END",
+                "bar_idx": bar_idx,
+            })
+        self._open.clear()
+        self.equity = self.balance
 
-    except KeyboardInterrupt:
-        print("\n\nStopped by user.")
+    @property
+    def n_open(self) -> int:
+        return len(self._open)
 
-    _print_final_report()
+    def stats(self) -> dict:
+        if not self.trades:
+            return {"n": 0, "wins": 0, "win_rate": 0.0,
+                    "net_pnl": 0.0, "roi": 0.0,
+                    "avg_win": 0.0, "avg_loss": 0.0, "profit_factor": 0.0}
+        wins   = [t for t in self.trades if t["pnl"] > 0]
+        losses = [t for t in self.trades if t["pnl"] <= 0]
+        gross_win  = sum(t["pnl"] for t in wins)
+        gross_loss = abs(sum(t["pnl"] for t in losses))
+        net = self.balance - self.start_balance
+        return {
+            "n":             len(self.trades),
+            "wins":          len(wins),
+            "win_rate":      len(wins) / len(self.trades) * 100,
+            "net_pnl":       round(net, 2),
+            "roi":           round(net / self.start_balance * 100, 2),
+            "avg_win":       round(gross_win / max(len(wins), 1), 2),
+            "avg_loss":      round(-gross_loss / max(len(losses), 1), 2),
+            "profit_factor": round(gross_win / max(gross_loss, 0.01), 2),
+        }
 
 
-def run_backtest():
+def run_backtest_engine(
+    m15_full, h1_full, h4_full,
+    params: StrategyParams,
+    lot: float = FIXED_LOT,
+    verbose: bool = False,
+) -> dict:
     """
-    Walk-forward backtest on last 60 days of real M15 data.
-    Uses a rolling window: at each M15 bar, feeds all prior bars to the strategy.
+    Walk-forward backtest. Returns stats dict.
+    Uses vectorised bar updates — no per-bar Python loop for indicators
+    (only the signal check loop is in Python).
     """
-    dc.connect()
-    print_header()
-    print("  Mode: BACKTEST on last 60 days of real XAU/USD data\n")
+    import logging
+    if not verbose:
+        logging.disable(logging.INFO)
 
-    logger.info("Generating realistic XAU/USD synthetic data…")
-    from trader.synthetic_data import generate_xauusd, resample_to_h1
-    # seed=7 gives more varied bull+bear trend regimes with clearer momentum
-    m15_full = generate_xauusd(n_bars=8000, timeframe_minutes=15, seed=7)
-    h1_full  = resample_to_h1(m15_full)
-
-    logger.info("M15 bars: %d   H1 bars: %d", len(m15_full), len(h1_full))
-    logger.info("Running strategy walk-forward…")
-
-    # Need at least 200 H1 bars for EMA200; skip the warmup period
-    WARMUP = 200
-    signals_found = 0
-    bars_processed = 0
-    last_entry_bar = -999  # cooldown tracker
+    account = PaperAccount()
+    # Need ~200 H1 bars (EMA200) = ~800 M15 bars; add buffer for H4 EMA50
+    WARMUP = 900
+    last_entry_bar = -9999
+    n_signals = 0
 
     for i in range(WARMUP, len(m15_full)):
-        m15_window = m15_full.iloc[:i+1]
-        bar_time   = m15_full.index[i]
+        bar_time  = m15_full.index[i]
+        bar_high  = float(m15_full["high"].iloc[i])
+        bar_low   = float(m15_full["low"].iloc[i])
+        bar_close = float(m15_full["close"].iloc[i])
+        bar_open  = float(m15_full["open"].iloc[i])
 
-        # Align H1 window to bars before this M15 bar
-        h1_window = h1_full[h1_full.index <= bar_time]
-        if len(h1_window) < WARMUP:
+        # Update open positions first
+        account.update(bar_high, bar_low, i)
+
+        # Guards
+        if account.n_open >= 1:
+            continue
+        if (i - last_entry_bar) < params.signal_cooldown_bars:
+            continue
+        if account.balance < account.start_balance * 0.85:
+            break   # daily-style hard stop at -15%
+
+        m15_w = m15_full.iloc[max(0, i - 350): i + 1]
+        h1_w  = h1_full[h1_full.index <= bar_time].iloc[-250:]
+        h4_w  = h4_full[h4_full.index <= bar_time].iloc[-120:]
+
+        if len(h4_w) < 60 or len(h1_w) < 210:
             continue
 
-        bars_processed += 1
-
-        # Update open positions against this bar's close price
-        bar_price = float(m15_full["close"].iloc[i])
-        dc._account.update_equity(bar_price)
-
-        # Guard: max open trades
-        if len(dc._account.open_positions) >= rcfg.max_open_trades:
-            continue
-
-        # Guard: daily loss
-        if dc._account.daily_drawdown_pct() >= risk_cfg.daily_loss_limit_pct:
-            continue
-
-        # Guard: signal cooldown (don't re-enter within N bars of last entry)
-        bars_since_last = bars_processed - last_entry_bar
-        if bars_since_last < scfg.signal_cooldown_bars:
-            continue
-
-        sig = evaluate(m15_window, h1_window)
+        sig = evaluate(m15_w, h1_w, h4_w, params)
         if sig is None:
             continue
 
-        signals_found += 1
-        equity = dc._account.equity
-
-        # Dynamic SL/TP based on current ATR
-        point = 0.01
-        if rcfg.atr_based_risk:
-            sl_points = int(sig.atr_value / point * rcfg.atr_sl_mult)
-            tp_points = int(sig.atr_value / point * rcfg.atr_tp_mult)
-        else:
-            sl_points = rcfg.stop_loss_points
-            tp_points = rcfg.take_profit_points
-
-        lot = dc.calc_lot_size(sl_points, equity)
-
-        # Simulate entry on next bar's open (realistic)
-        if i + 1 < len(m15_full):
-            entry_price = float(m15_full["open"].iloc[i + 1])
-        else:
-            entry_price = bar_price
+        n_signals += 1
+        # Entry on next bar open (realistic slippage simulation)
+        if i + 1 >= len(m15_full):
+            break
+        entry = float(m15_full["open"].iloc[i + 1])
 
         if sig.direction == "BUY":
-            tp = entry_price + tp_points * point
-            sl = entry_price - sl_points * point
+            sl = entry - sig.sl_pts * POINT
+            tp = entry + sig.tp_pts * POINT
+            be = entry + sig.be_pts * POINT
         else:
-            tp = entry_price - tp_points * point
-            sl = entry_price + sl_points * point
+            sl = entry + sig.sl_pts * POINT
+            tp = entry - sig.tp_pts * POINT
+            be = entry - sig.be_pts * POINT
 
-        dc._account.place_order(sig.direction, lot, entry_price, sl, tp,
-                                comment=f"bt-{sig.entry_type.lower()[:2]}")
-        last_entry_bar = bars_processed
-        rr = tp_points / sl_points if sl_points else 0
-        logger.info("[%s] %s %s @ %.2f  lot=%.2f  SL=%d pt  TP=%d pt  R:R=1:%.1f",
-                    bar_time.strftime("%m-%d %H:%M"), sig.direction, sig.entry_type,
-                    entry_price, lot, sl_points, tp_points, rr)
+        account.open_trade(sig.direction, entry, sl, tp, be, lot, i)
+        last_entry_bar = i
 
-        if bars_processed % 500 == 0:
-            logger.info("Progress: %d/%d bars  |  equity=$%.2f",
-                        bars_processed, len(m15_full)-WARMUP, dc._account.equity)
+        if verbose:
+            logging.disable(logging.NOTSET)
+            logger.warning("[%s] %s %s @ %.2f  SL=%d  TP=%d",
+                           bar_time.strftime("%m-%d %H:%M"),
+                           sig.direction, sig.entry_type, entry,
+                           sig.sl_pts, sig.tp_pts)
+            logging.disable(logging.INFO)
 
-    # Close any remaining open positions at last price
-    last_price = float(m15_full["close"].iloc[-1])
-    for pos in list(dc._account.open_positions):
-        dc._account._close_position(pos, last_price, "END")
+    account.close_all(float(m15_full["close"].iloc[-1]), len(m15_full) - 1)
 
-    logger.info("Backtest complete — %d signals from %d bars", signals_found, bars_processed)
-    _print_final_report()
+    logging.disable(logging.NOTSET)
+    s = account.stats()
+    s["n_signals"] = n_signals
+    return s
 
 
-def _print_final_report():
-    account = dc._account
-    print(f"\n{'═'*62}")
-    print("  DEMO ACCOUNT FINAL REPORT")
-    print(f"{'─'*62}")
-    print_account(account)
-    if account.closed_trades:
-        print(f"\n  All trades:")
-        print_closed_trades(account)
-        wins = [t for t in account.closed_trades if t["pnl"] > 0]
-        losses = [t for t in account.closed_trades if t["pnl"] <= 0]
-        if wins:
-            print(f"\n  Avg win  : ${sum(t['pnl'] for t in wins)/len(wins):.2f}")
-        if losses:
-            print(f"  Avg loss : ${sum(t['pnl'] for t in losses)/len(losses):.2f}")
-        total = sum(t["pnl"] for t in account.closed_trades)
-        print(f"  Net P&L  : ${total:+.2f}")
-        roi = total / dc.DEMO_BALANCE * 100
-        print(f"  ROI      : {roi:+.2f}%")
-    print(f"{'═'*62}\n")
+# ── Parameter grid search ─────────────────────────────────────────────────────
 
+def run_optimizer(m15, h1, h4):
+    print(f"\n{'═'*66}")
+    print("  STRATEGY OPTIMIZER — searching for best parameter set")
+    print(f"{'─'*66}")
+    print(f"  {'ADX':>3} {'ST':>4} {'BO':>4} {'MOM':>4} "
+          f"{'SL':>4} {'TP':>4} "
+          f"{'N':>4} {'WIN%':>5} {'P/F':>5} {'NET P&L':>9} {'ROI':>5}")
+    print(DIVIDER)
+
+    adx_values    = [20, 25, 28]
+    st_mults      = [2.5, 3.0]
+    bo_atr_mults  = [0.8, 1.2]
+    mom_scores    = [0.5, 1.0]
+    sl_mults      = [2.0, 2.5, 3.0]
+    tp_mults      = [3.5, 4.5, 5.5]
+
+    results = []
+    n_tested = 0
+
+    for adx_v, st_m, bo_m, mom_s, sl_m, tp_m in itertools.product(
+        adx_values, st_mults, bo_atr_mults, mom_scores, sl_mults, tp_mults
+    ):
+        p = StrategyParams(
+            adx_min=adx_v,
+            st_mult=st_m,
+            breakout_atr_mult=bo_m,
+            min_momentum_score=mom_s,
+            atr_sl_mult=sl_m,
+            atr_tp_mult=tp_m,
+            atr_be_mult=sl_m * 0.6,
+        )
+        s = run_backtest_engine(m15, h1, h4, p, verbose=False)
+        n_tested += 1
+
+        # Require at least 15 trades for statistical validity
+        if s["n"] < 15:
+            continue
+
+        score = s["win_rate"] * s["profit_factor"]
+        results.append((score, p, s))
+
+        print(f"  {adx_v:>3} {st_m:>4.1f} {bo_m:>4.1f} {mom_s:>4.1f} "
+              f"{sl_m:>4.1f} {tp_m:>4.1f} "
+              f"{s['n']:>4} {s['win_rate']:>5.1f} {s['profit_factor']:>5.2f} "
+              f"${s['net_pnl']:>9.2f} {s['roi']:>5.1f}%")
+
+    print(f"\n  [{n_tested} configs tested, {len(results)} with ≥15 trades]")
+
+    if not results:
+        print("  No valid parameter sets found (need ≥10 trades).")
+        return StrategyParams()
+
+    results.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_params, best_stats = results[0]
+
+    print(f"\n{'═'*66}")
+    print("  BEST PARAMETER SET")
+    print(f"{'─'*66}")
+    print(f"  ADX min       : {best_params.adx_min}")
+    print(f"  Supertrend ×  : {best_params.st_mult}")
+    print(f"  Breakout ATR× : {best_params.breakout_atr_mult}")
+    print(f"  SL ATR×       : {best_params.atr_sl_mult}")
+    print(f"  TP ATR×       : {best_params.atr_tp_mult}")
+    print(f"{'─'*66}")
+    _print_stats(best_stats)
+    print(f"{'═'*66}\n")
+
+    return best_params
+
+
+# ── Single backtest ───────────────────────────────────────────────────────────
+
+def _print_stats(s: dict):
+    print(f"  Trades        : {s['n']}  ({s['wins']} wins)")
+    print(f"  Win rate      : {s['win_rate']:.1f}%")
+    print(f"  Profit factor : {s['profit_factor']:.2f}")
+    print(f"  Avg win       : ${s['avg_win']:.2f}")
+    print(f"  Avg loss      : ${s['avg_loss']:.2f}")
+    print(f"  Net P&L       : ${s['net_pnl']:+.2f}")
+    print(f"  ROI           : {s['roi']:+.2f}%")
+    print(f"  Final equity  : ${10_000 + s['net_pnl']:,.2f}")
+
+
+def run_single(m15, h1, h4, params: StrategyParams, verbose: bool = True):
+    print(f"\n{'═'*66}")
+    print("  XAU/USD DEMO — BACKTEST (Strategy v2, 0.30 lot)")
+    print(f"  M15 bars: {len(m15)}   H1 bars: {len(h1)}   H4 bars: {len(h4)}")
+    print(f"  Session : {params.session_open}:00–{params.session_close}:00 UTC  "
+          f"(London + New York)")
+    print(f"  SL: {params.atr_sl_mult}×ATR   TP: {params.atr_tp_mult}×ATR   "
+          f"R:R=1:{params.atr_tp_mult/params.atr_sl_mult:.1f}")
+    print(f"{'─'*66}")
+
+    logging.getLogger().setLevel(logging.INFO)
+    s = run_backtest_engine(m15, h1, h4, params, lot=FIXED_LOT, verbose=verbose)
+    logging.getLogger().setLevel(logging.WARNING)
+
+    print(f"\n{'═'*66}")
+    print("  FINAL REPORT")
+    print(f"{'─'*66}")
+    _print_stats(s)
+    print(f"{'═'*66}\n")
+    return s
+
+
+# ── Live paper-trading loop ───────────────────────────────────────────────────
+
+def run_live(params: StrategyParams, max_ticks: int = 0):
+    logging.getLogger().setLevel(logging.INFO)
+    logger.warning("Starting live paper-trading loop…")
+    dc.connect()
+    tick = 0
+    last_entry_bar = -9999
+    account = PaperAccount()
+    bar_i = 0
+
+    try:
+        while True:
+            m15 = dc.get_ohlcv("XAUUSD", "M15", count=350)
+            h1  = dc.get_ohlcv("XAUUSD", "H1",  count=250)
+            if m15 is None or h1 is None:
+                time.sleep(60); continue
+
+            h4 = _resample_h4(m15.iloc[-500:] if len(m15) >= 500 else m15)
+
+            price = float(m15["close"].iloc[-1])
+            account.update(float(m15["high"].iloc[-1]),
+                           float(m15["low"].iloc[-1]), bar_i)
+
+            s = account.stats()
+            print(f"\n[Tick {tick+1}] {datetime.now(timezone.utc).strftime('%H:%M UTC')}  "
+                  f"XAU/USD ${price:,.2f}  |  "
+                  f"Equity ${10_000+s['net_pnl']:,.2f}  P&L ${s['net_pnl']:+.2f}  "
+                  f"Trades {s['n']} (WR {s['win_rate']:.0f}%)")
+
+            if account.n_open < 1 and (bar_i - last_entry_bar) >= params.signal_cooldown_bars:
+                sig = evaluate(m15, h1, h4, params)
+                if sig:
+                    entry = price
+                    sl = entry - sig.sl_pts * POINT if sig.direction == "BUY" else entry + sig.sl_pts * POINT
+                    tp = entry + sig.tp_pts * POINT if sig.direction == "BUY" else entry - sig.tp_pts * POINT
+                    be = entry + sig.be_pts * POINT if sig.direction == "BUY" else entry - sig.be_pts * POINT
+                    account.open_trade(sig.direction, entry, sl, tp, be, FIXED_LOT, bar_i)
+                    last_entry_bar = bar_i
+                    print(f"  *** {sig.direction} {sig.entry_type} opened  "
+                          f"SL={sig.sl_pts}pt TP={sig.tp_pts}pt ***")
+                    print(f"  {sig.reason}")
+                else:
+                    print("  No signal.")
+
+            bar_i += 1
+            tick += 1
+            if max_ticks and tick >= max_ticks:
+                break
+            time.sleep(60)
+    except KeyboardInterrupt:
+        print("\nStopped by user.")
+
+    account.close_all(float(m15["close"].iloc[-1]), bar_i)
+    s = account.stats()
+    print(f"\n{'═'*66}")
+    print("  LIVE SESSION REPORT")
+    print(f"{'─'*66}")
+    _print_stats(s)
+    print(f"{'═'*66}\n")
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    from trader.config import risk_cfg  # needed for backtest guard
-
-    parser = argparse.ArgumentParser(description="XAU/USD Demo Trader")
-    parser.add_argument("--backtest", action="store_true",
-                        help="Run backtest on 60 days of historical data")
-    parser.add_argument("--ticks", type=int, default=0,
-                        help="Max live ticks before exiting (0 = run forever)")
+    parser = argparse.ArgumentParser(description="XAU/USD Demo Trader v2")
+    parser.add_argument("--backtest",  action="store_true")
+    parser.add_argument("--optimize",  action="store_true")
+    parser.add_argument("--ticks",     type=int, default=0)
+    parser.add_argument("--seed",      type=int, default=7)
+    parser.add_argument("--bars",      type=int, default=10000)
+    parser.add_argument("--verbose",   action="store_true")
     args = parser.parse_args()
 
-    if args.backtest:
-        run_backtest()
+    print(f"\n  Generating {args.bars} bars of synthetic XAU/USD data (seed={args.seed})…")
+    m15_full = generate_xauusd(n_bars=args.bars, timeframe_minutes=15, seed=args.seed)
+    h1_full  = resample_to_h1(m15_full)
+    h4_full  = _resample_h4(m15_full)
+    print(f"  M15: {len(m15_full)}  H1: {len(h1_full)}  H4: {len(h4_full)}")
+
+    if args.optimize:
+        best_params = run_optimizer(m15_full, h1_full, h4_full)
+        print("  Running final backtest with best params…")
+        run_single(m15_full, h1_full, h4_full, best_params, verbose=args.verbose)
+
+    elif args.backtest:
+        run_single(m15_full, h1_full, h4_full, StrategyParams(), verbose=args.verbose)
+
     else:
-        run_live(max_ticks=args.ticks)
+        run_live(StrategyParams(), max_ticks=args.ticks)

@@ -38,7 +38,11 @@ class StrategyConfig:
     ema_trend: int = 200
 
     # ADX trend-strength threshold
-    adx_threshold: float = 25.0
+    adx_threshold: float = 25.0        # optimizer best: 25
+
+    # Supertrend (H4 trend filter)
+    st_period: int = 10
+    st_mult: float = 3.0               # optimizer best: 3.0
 
     # Momentum indicators
     rsi_period: int = 14
@@ -55,19 +59,20 @@ class StrategyConfig:
     atr_period: int = 14
 
     # Breakout: price must exceed this many ATR multiples above swing high/low
-    # Higher = fewer but cleaner breakout signals
-    breakout_atr_mult: float = 1.0
+    breakout_atr_mult: float = 0.8     # optimizer best: 0.8
 
     # Minimum bars since the reference swing high/low was formed
-    # Prevents entering on the very bar a swing is identified
     breakout_min_swing_age_bars: int = 4
 
     # Bars to wait after a trade entry before allowing another signal
-    signal_cooldown_bars: int = 16   # 4 hours on M15
+    signal_cooldown_bars: int = 20     # optimizer best: 20 bars (5 hours on M15)
 
-    # Pullback: price retraces this fraction of the last swing before entry
-    pullback_min_retrace: float = 0.30
-    pullback_max_retrace: float = 0.65
+    # Momentum: require both RSI zone AND MACD histogram to confirm (score=1.0)
+    min_momentum_score: float = 1.0    # optimizer best: 1.0 (both filters must fire)
+
+    # Pullback: Fibonacci retracement zone for pullback entries
+    pullback_min_retrace: float = 0.382
+    pullback_max_retrace: float = 0.618
 
     # Only take signals above this composite strength
     min_signal_strength: float = 0.75
@@ -82,16 +87,18 @@ class RiskConfig:
 
     # ATR-based dynamic SL/TP (preferred — adapts to current volatility)
     atr_based_risk: bool = True
-    atr_sl_mult: float = 2.0        # SL = 2x ATR
-    atr_tp_mult: float = 3.5        # TP = 3.5x ATR → R:R ≈ 1:1.75
+    atr_sl_mult: float = 2.0        # optimizer best: 2.0 (SL = 2×ATR)
+    atr_tp_mult: float = 5.5        # optimizer best: 5.5 (TP = 5.5×ATR → R:R 1:2.75)
+    atr_be_mult: float = 1.2        # move SL to breakeven at 1.2×ATR profit
 
     max_risk_pct: float = 1.0        # max 1% of account equity per trade
     max_open_trades: int = 1         # conservative: 1 position at a time
     daily_loss_limit_pct: float = 3.0  # halt trading if daily drawdown exceeds 3%
 
-    # Minimum lot size Vantage allows; keep conservative
+    # Fixed lot size (0.30 per trade as required)
+    fixed_lot: float = 0.30
     min_lot: float = 0.01
-    max_lot: float = 0.10
+    max_lot: float = 0.30           # cap at 0.30 lot
 
     # Magic number to tag bot orders in MT5
     magic_number: int = 20240601

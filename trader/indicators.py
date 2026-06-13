@@ -69,6 +69,52 @@ def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return dx.ewm(com=period - 1, adjust=False).mean()
 
 
+def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> pd.Series:
+    """
+    Supertrend indicator. Returns a Series of +1 (bullish) / -1 (bearish).
+    Classic implementation: midpoint ± multiplier * ATR bands.
+    """
+    high, low, close = df["high"], df["low"], df["close"]
+    atr_s = atr(df, period)
+
+    mid = (high + low) / 2
+    upper = mid + multiplier * atr_s
+    lower = mid - multiplier * atr_s
+
+    trend = pd.Series(1, index=df.index, dtype=int)
+    final_upper = upper.copy()
+    final_lower = lower.copy()
+
+    for i in range(1, len(df)):
+        # Upper band
+        if upper.iloc[i] < final_upper.iloc[i - 1] or close.iloc[i - 1] > final_upper.iloc[i - 1]:
+            final_upper.iloc[i] = upper.iloc[i]
+        else:
+            final_upper.iloc[i] = final_upper.iloc[i - 1]
+
+        # Lower band
+        if lower.iloc[i] > final_lower.iloc[i - 1] or close.iloc[i - 1] < final_lower.iloc[i - 1]:
+            final_lower.iloc[i] = lower.iloc[i]
+        else:
+            final_lower.iloc[i] = final_lower.iloc[i - 1]
+
+        # Trend direction
+        if trend.iloc[i - 1] == -1 and close.iloc[i] > final_upper.iloc[i - 1]:
+            trend.iloc[i] = 1
+        elif trend.iloc[i - 1] == 1 and close.iloc[i] < final_lower.iloc[i - 1]:
+            trend.iloc[i] = -1
+        else:
+            trend.iloc[i] = trend.iloc[i - 1]
+
+    return trend
+
+
+def volume_ratio(df: pd.DataFrame, period: int = 20) -> pd.Series:
+    """Current bar volume relative to the rolling mean — > 1.5 = volume spike."""
+    vol = df["volume"].astype(float)
+    return vol / vol.rolling(period).mean()
+
+
 def swing_highs_lows(df: pd.DataFrame, lookback: int = 10) -> tuple[pd.Series, pd.Series]:
     """
     Return boolean Series marking swing high and swing low bars.
@@ -90,3 +136,24 @@ def swing_highs_lows(df: pd.DataFrame, lookback: int = 10) -> tuple[pd.Series, p
             is_swing_low.iloc[i] = True
 
     return is_swing_high, is_swing_low
+
+
+def candle_body_ratio(df: pd.DataFrame) -> pd.Series:
+    """Body size as fraction of total candle range (0–1). Strong candles > 0.55."""
+    body = (df["close"] - df["open"]).abs()
+    rng = df["high"] - df["low"]
+    return body / rng.replace(0, np.nan)
+
+
+def fibonacci_levels(swing_low: float, swing_high: float) -> dict:
+    """Return key Fibonacci retracement levels for a given swing."""
+    diff = swing_high - swing_low
+    return {
+        "0.0":   swing_high,
+        "0.236": swing_high - 0.236 * diff,
+        "0.382": swing_high - 0.382 * diff,
+        "0.5":   swing_high - 0.5   * diff,
+        "0.618": swing_high - 0.618 * diff,
+        "0.786": swing_high - 0.786 * diff,
+        "1.0":   swing_low,
+    }

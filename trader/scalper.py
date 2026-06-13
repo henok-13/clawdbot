@@ -1,15 +1,14 @@
 """
 High-frequency scalping backtest engine for XAU/USD.
 
-Strategy: Enter on M5 bars with full multi-timeframe confirmation; exit at
-fixed TP (+200 pts) or SL (-135 pts). Target 15+ trades per day.
-Lot size: 0.60.
+Strategy: Enter on M5 bars with full multi-timeframe confirmation; exit via
+ATR-adaptive TP/SL with partial close + trailing stop. Target 15+ trades/day.
 
 Multi-timeframe confirmation stack (4 layers):
   H4  : Supertrend direction must agree
   H1  : EMA20>EMA50>EMA100 + RSI zone (>52 bull / <48 bear)
   M5  : ADX ≥ 22, RSI zone, MACD sign, body ≥ 0.38, price vs EMA20
-  Risk: Breakeven stop at +50 pts (SL slides to entry)
+  Risk: ATR-adaptive SL/TP with breakeven + partial TP + trailing stop
 
 XAU/USD constants:
   POINT = 0.01  |  PPL = $1.00 per lot per point
@@ -17,21 +16,45 @@ XAU/USD constants:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
 
-from .indicators import ema, rsi, macd, adx, supertrend, candle_body_ratio, volume_ratio
+from .indicators import ema, rsi, macd, adx, supertrend, candle_body_ratio, volume_ratio, atr
 
 POINT = 0.01
-PPL   = 100 * POINT
+PPL   = 100 * POINT   # $1.00 per lot per point (100 * 0.01 = 1.00)
 
 
 @dataclass
 class ScalpParams:
-    tp_points: int        = 200
-    sl_points: int        = 135
+    # ── ATR-adaptive TP/SL (Fix 1) ───────────────────────────────────────────
+    atr_period: int       = 14
+    atr_sl_mult: float    = 1.5   # SL = 1.5 × ATR
+    atr_tp_mult: float    = 3.5   # full TP = 3.5 × ATR (mostly closed by trail)
+
+    # ── Volatility regime filter (Fix 2) ─────────────────────────────────────
+    # Note: atr_regime_max also automatically skips news-spike bars (Fix 6)
+    atr_regime_period: int   = 50
+    atr_regime_min: float    = 0.7   # skip if ATR < 70% of rolling avg (too quiet)
+    atr_regime_max: float    = 2.5   # skip if ATR > 250% of rolling avg (news spike)
+
+    # ── Compound lot sizing (Fix 3) ───────────────────────────────────────────
+    use_compound_sizing: bool = True
+    risk_pct: float           = 0.005  # risk 0.5% of current equity per trade
+    max_lot: float            = 3.0
+
+    # ── Partial TP + trailing stop (Fix 4) ───────────────────────────────────
+    partial_pct: float      = 0.50   # close 50% at partial TP
+    partial_tp_mult: float  = 2.0    # partial TP at 2.0 × ATR
+    trail_atr_mult: float   = 0.8    # trail stop: 0.8 × ATR behind running extreme
+    be_atr_mult: float      = 0.5    # slide SL to entry when 0.5 × ATR in profit
+
+    # ── Consecutive loss daily stop (Fix 7) ───────────────────────────────────
+    max_consec_losses: int  = 3   # halt rest of day after 3 straight losses
+
+    # ── Existing session / filter params ─────────────────────────────────────
     max_trades_day: int   = 60
     session_open: int     = 8    # London open (UTC)
     session_close: int    = 18   # NY mid-session (UTC) — peak trending hours
@@ -47,9 +70,8 @@ class ScalpParams:
     rsi_buy_max: float    = 68.0
     rsi_sell_min: float   = 32.0
     rsi_sell_max: float   = 48.0
-    be_trigger_points: int = 50    # slide SL to entry once +50 pts in profit
-    min_vol_ratio: float  = 0.90   # volume must be ≥ 90% of 20-bar average
-    daily_loss_limit: float = 200.0  # stop trading the day once this loss is hit
+    min_vol_ratio: float  = 0.0    # volume must be ≥ this ratio (0.0 = disabled)
+    daily_loss_limit: float    = 200.0  # stop trading the day once this loss is hit
     daily_profit_target: float = 500.0  # stop trading the day once this profit is hit
 
 
@@ -95,7 +117,7 @@ def run_scalper(
     h1     : H1 OHLCV DataFrame with DatetimeIndex (UTC).
     h4     : H4 OHLCV DataFrame (optional — built from m5 if None).
     params : ScalpParams (uses defaults if None).
-    lot    : fixed lot size.
+    lot    : fixed lot size (used when use_compound_sizing=False).
     start_balance : starting account equity.
 
     Returns
@@ -130,6 +152,11 @@ def run_scalper(
     adx_arr  = adx(m5, 14).values
     vol_arr  = volume_ratio(m5, 20).values
 
+    # ATR array for adaptive SL/TP (Fix 1) and regime filter (Fix 2)
+    atr_raw = atr(m5, params.atr_period).values
+    # Rolling average ATR for regime filter
+    atr_avg_arr = pd.Series(atr_raw).rolling(params.atr_regime_period).mean().values
+
     # H1 layers
     h1_trend_arr = _build_h1_trend(m5, h1) if params.use_h1_trend else np.ones(n, dtype=np.int8)
     h1_rsi_arr   = _build_h1_rsi(m5, h1)   if params.use_h1_rsi   else np.full(n, 50.0)
@@ -140,26 +167,33 @@ def run_scalper(
     hours = m5.index.hour
     in_session = (hours >= params.session_open) & (hours < params.session_close)
 
-    tp_price    = params.tp_points * POINT
-    sl_price    = params.sl_points * POINT
-    be_price    = params.be_trigger_points * POINT
-    spread_cost = params.spread_points * lot * PPL
-
     # ── Walk-forward loop ─────────────────────────────────────────────────────
     balance  = start_balance
     trades: list[dict] = []
 
-    in_trade     = False
-    t_dir        = 0
-    t_entry      = 0.0
-    t_tp         = 0.0
-    t_sl_price   = 0.0
-    t_be_set     = False
+    in_trade = False
+
+    # Per-trade state (Fix 4: partial TP + trailing)
+    t_dir: int = 0
+    t_entry: float = 0.0
+    t_tp: float = 0.0          # full TP price
+    t_partial_tp: float = 0.0  # partial TP price
+    t_sl_price: float = 0.0
+    t_be_trigger: float = 0.0  # price at which to slide SL to entry
+    t_be_set: bool = False
+    t_partial_hit: bool = False
+    t_trail_dist: float = 0.0  # trailing distance in price units
+    t_running_extreme: float = 0.0
+    t_lot_initial: float = 0.0  # lot at trade open
+    t_lot: float = 0.0          # current lot (reduced after partial close)
+    t_accrued_pnl: float = 0.0  # P&L booked from partial close
+    t_atr_v: float = 0.0        # ATR at trade entry (for trail/be calcs)
     t_entry_date = None
 
     daily_counts: dict = {}
-    daily_pnl: dict = {}     # date -> running P&L for that day
-    warmup = 300   # slightly longer for H1/H4 indicator warmup
+    daily_pnl: dict = {}       # date -> running P&L for that day
+    daily_consec: dict = {}    # date -> current consecutive loss count (Fix 7)
+    warmup = 300               # slightly longer for H1/H4 indicator warmup
 
     for i in range(warmup, n):
         c = close[i]
@@ -169,15 +203,53 @@ def run_scalper(
 
         # ── Update open position ──────────────────────────────────────────────
         if in_trade:
-            # Slide SL to entry (breakeven) once profit target reached
-            if not t_be_set:
-                if t_dir == 1 and h >= t_entry + be_price:
-                    t_sl_price = t_entry
-                    t_be_set   = True
-                elif t_dir == -1 and l <= t_entry - be_price:
-                    t_sl_price = t_entry
-                    t_be_set   = True
+            spread_cost = params.spread_points * t_lot_initial * PPL  # one-time at open
 
+            # Step 1: Check breakeven trigger (if partial not yet hit)
+            if not t_partial_hit and not t_be_set:
+                if t_dir == 1 and h >= t_be_trigger:
+                    t_sl_price = t_entry
+                    t_be_set = True
+                elif t_dir == -1 and l <= t_be_trigger:
+                    t_sl_price = t_entry
+                    t_be_set = True
+
+            # Step 2: Check partial TP (if not yet hit)
+            if not t_partial_hit:
+                partial_hit = (t_dir == 1 and h >= t_partial_tp) or \
+                              (t_dir == -1 and l <= t_partial_tp)
+                if partial_hit:
+                    # Book partial P&L: price move from entry to partial_tp × partial lot
+                    if t_dir == 1:
+                        partial_tp_pts = (t_partial_tp - t_entry) / POINT
+                    else:
+                        partial_tp_pts = (t_entry - t_partial_tp) / POINT
+                    partial_lot = t_lot_initial * params.partial_pct
+                    t_accrued_pnl = partial_tp_pts * partial_lot * PPL
+                    # Switch to trailing: remaining lot, set trailing distance, running extreme
+                    t_lot = t_lot_initial * (1.0 - params.partial_pct)
+                    t_trail_dist = t_atr_v * params.trail_atr_mult
+                    t_running_extreme = t_partial_tp  # extreme starts at partial TP price
+                    t_partial_hit = True
+
+            # Step 3: Update trailing stop (after partial hit)
+            if t_partial_hit:
+                if t_dir == 1:
+                    # Update running high; slide SL up with trail
+                    if h > t_running_extreme:
+                        t_running_extreme = h
+                    trail_sl = t_running_extreme - t_trail_dist
+                    if trail_sl > t_sl_price:
+                        t_sl_price = trail_sl
+                else:
+                    # Update running low; slide SL down with trail
+                    if l < t_running_extreme:
+                        t_running_extreme = l
+                    trail_sl = t_running_extreme + t_trail_dist
+                    if trail_sl < t_sl_price:
+                        t_sl_price = trail_sl
+
+            # Step 4: Check full TP (remaining lot)
             if t_dir == 1:
                 tp_hit = h >= t_tp
                 sl_hit = l <= t_sl_price
@@ -191,31 +263,56 @@ def run_scalper(
                 and t_entry_date == bar_date
             )
 
+            closed = False
+
             if tp_hit:
-                pnl = params.tp_points * lot * PPL - spread_cost
-                balance += pnl
-                daily_pnl[t_entry_date] = daily_pnl.get(t_entry_date, 0.0) + pnl
-                trades.append({"pnl": round(pnl, 2), "result": "TP"})
-                in_trade = False
+                if t_dir == 1:
+                    exit_pts = (t_tp - t_entry) / POINT
+                else:
+                    exit_pts = (t_entry - t_tp) / POINT
+                final_pnl = exit_pts * t_lot * PPL
+                total_pnl = t_accrued_pnl + final_pnl - spread_cost
+                balance += total_pnl
+                daily_pnl[t_entry_date] = daily_pnl.get(t_entry_date, 0.0) + total_pnl
+                result = "TP" if not t_partial_hit else "PARTIAL_TRAIL"
+                trades.append({"pnl": round(total_pnl, 2), "result": result})
+                closed = True
 
             elif sl_hit:
-                if t_be_set:
-                    pnl    = -spread_cost
+                # SL hit — check if it's breakeven (SL was slid to entry)
+                if t_be_set and not t_partial_hit and abs(t_sl_price - t_entry) < POINT:
+                    # Pure breakeven: only spread cost lost
+                    total_pnl = -spread_cost
                     result = "BE"
                 else:
-                    pnl    = -params.sl_points * lot * PPL - spread_cost
-                    result = "SL"
-                balance += pnl
-                daily_pnl[t_entry_date] = daily_pnl.get(t_entry_date, 0.0) + pnl
-                trades.append({"pnl": round(pnl, 2), "result": result})
-                in_trade = False
+                    if t_dir == 1:
+                        exit_pts = (t_sl_price - t_entry) / POINT
+                    else:
+                        exit_pts = (t_entry - t_sl_price) / POINT
+                    final_pnl = exit_pts * t_lot * PPL
+                    total_pnl = t_accrued_pnl + final_pnl - spread_cost
+                    result = "TRAIL" if t_partial_hit else "SL"
+                balance += total_pnl
+                daily_pnl[t_entry_date] = daily_pnl.get(t_entry_date, 0.0) + total_pnl
+                trades.append({"pnl": round(total_pnl, 2), "result": result})
+                closed = True
 
             elif eod_close:
                 pnl_pts = (c - t_entry) / POINT if t_dir == 1 else (t_entry - c) / POINT
-                pnl = pnl_pts * lot * PPL - spread_cost
-                balance += pnl
-                daily_pnl[t_entry_date] = daily_pnl.get(t_entry_date, 0.0) + pnl
-                trades.append({"pnl": round(pnl, 2), "result": "EOD"})
+                final_pnl = pnl_pts * t_lot * PPL
+                total_pnl = t_accrued_pnl + final_pnl - spread_cost
+                balance += total_pnl
+                daily_pnl[t_entry_date] = daily_pnl.get(t_entry_date, 0.0) + total_pnl
+                trades.append({"pnl": round(total_pnl, 2), "result": "EOD"})
+                closed = True
+
+            if closed:
+                # Fix 7: Update consecutive loss counter
+                if total_pnl <= 0:
+                    daily_consec[t_entry_date] = daily_consec.get(t_entry_date, 0) + 1
+                else:
+                    # Win resets the streak
+                    daily_consec[t_entry_date] = 0
                 in_trade = False
 
             if in_trade:
@@ -235,6 +332,22 @@ def run_scalper(
             continue
         if day_pnl >= params.daily_profit_target:
             continue
+
+        # Fix 7: Consecutive loss daily stop — skip if hit max consecutive losses
+        if daily_consec.get(bar_date, 0) >= params.max_consec_losses:
+            continue
+
+        # ATR and regime checks
+        atr_v = atr_raw[i]
+        atr_avg = atr_avg_arr[i]
+        if np.isnan(atr_v) or atr_v <= 0:
+            continue
+
+        # Fix 2: Volatility regime filter (also handles news spikes via atr_regime_max)
+        if not np.isnan(atr_avg) and atr_avg > 0:
+            ratio = atr_v / atr_avg
+            if ratio < params.atr_regime_min or ratio > params.atr_regime_max:
+                continue
 
         # Layer 1 — H1 EMA trend direction
         h1_d = h1_trend_arr[i]
@@ -267,7 +380,7 @@ def run_scalper(
             continue
 
         # Layer 3 — volume confirmation (above-average participation)
-        if not np.isnan(vol_v) and vol_v < params.min_vol_ratio:
+        if not np.isnan(vol_v) and params.min_vol_ratio > 0 and vol_v < params.min_vol_ratio:
             continue
 
         # Layer 2 — H1 RSI confirmation
@@ -298,28 +411,56 @@ def run_scalper(
         if entry <= 0:
             continue
 
-        if d == 1:
-            t_tp       = entry + tp_price
-            t_sl_price = entry - sl_price
-        else:
-            t_tp       = entry - tp_price
-            t_sl_price = entry + sl_price
+        # Fix 1: ATR-adaptive SL/TP (in price units)
+        sl_price_dist = atr_v * params.atr_sl_mult
+        tp_price_dist = atr_v * params.atr_tp_mult
+        partial_tp_dist = atr_v * params.partial_tp_mult
+        be_trigger_dist = atr_v * params.be_atr_mult
 
-        in_trade     = True
-        t_dir        = d
-        t_entry      = entry
-        t_be_set     = False
-        t_entry_date = m5.index[i + 1].date()
+        # Fix 3: Compound lot sizing
+        if params.use_compound_sizing:
+            sl_pts_num = sl_price_dist / POINT   # SL distance in points count
+            risk_usd = balance * params.risk_pct
+            t_lot_val = min(risk_usd / max(sl_pts_num * PPL, 0.001), params.max_lot)
+            t_lot_val = max(round(t_lot_val, 2), 0.01)
+        else:
+            t_lot_val = lot
+
+        if d == 1:
+            t_tp        = entry + tp_price_dist
+            t_sl_price  = entry - sl_price_dist
+            t_partial_tp = entry + partial_tp_dist
+            t_be_trigger = entry + be_trigger_dist
+        else:
+            t_tp        = entry - tp_price_dist
+            t_sl_price  = entry + sl_price_dist
+            t_partial_tp = entry - partial_tp_dist
+            t_be_trigger = entry - be_trigger_dist
+
+        in_trade         = True
+        t_dir            = d
+        t_entry          = entry
+        t_be_set         = False
+        t_partial_hit    = False
+        t_accrued_pnl    = 0.0
+        t_lot_initial    = t_lot_val
+        t_lot            = t_lot_val
+        t_trail_dist     = 0.0
+        t_running_extreme = entry
+        t_atr_v          = atr_v
+        t_entry_date     = m5.index[i + 1].date()
 
         daily_counts[bar_date] = daily_count + 1
 
     # Close leftover at last bar
     if in_trade:
-        cp      = close[-1]
+        cp = close[-1]
+        spread_cost = params.spread_points * t_lot_initial * PPL
         pnl_pts = (cp - t_entry) / POINT if t_dir == 1 else (t_entry - cp) / POINT
-        pnl     = pnl_pts * lot * PPL - spread_cost
-        balance += pnl
-        trades.append({"pnl": round(pnl, 2), "result": "END"})
+        final_pnl = pnl_pts * t_lot * PPL
+        total_pnl = t_accrued_pnl + final_pnl - spread_cost
+        balance += total_pnl
+        trades.append({"pnl": round(total_pnl, 2), "result": "END"})
 
     # ── Stats ─────────────────────────────────────────────────────────────────
     if not trades:
@@ -330,29 +471,30 @@ def run_scalper(
             "final_balance": round(start_balance, 2),
         }
 
-    wins       = [t for t in trades if t["result"] == "TP"]
-    breakevens = [t for t in trades if t["result"] == "BE"]
-    losses     = [t for t in trades if t["result"] in ("SL", "EOD", "END") and t["pnl"] < 0]
+    # Classification: wins = total_pnl > 0, losses = total_pnl <= 0, be = result == "BE"
+    wins_list       = [t for t in trades if t["pnl"] > 0]
+    losses_list     = [t for t in trades if t["pnl"] <= 0 and t["result"] != "BE"]
+    breakevens_list = [t for t in trades if t["result"] == "BE"]
 
-    gw  = sum(t["pnl"] for t in wins)
-    gl  = abs(sum(t["pnl"] for t in losses))
+    gw  = sum(t["pnl"] for t in wins_list)
+    gl  = abs(sum(t["pnl"] for t in losses_list))
     net = balance - start_balance
 
     trade_dates = set(daily_counts.keys())
     n_days = max(len(trade_dates), 1)
 
-    decisive = len(wins) + len(losses)
+    decisive = len(wins_list) + len(losses_list)
 
     return {
         "n":              len(trades),
-        "wins":           len(wins),
-        "losses":         len(losses),
-        "breakevens":     len(breakevens),
-        "win_rate":       round(len(wins) / max(decisive, 1) * 100, 1),
+        "wins":           len(wins_list),
+        "losses":         len(losses_list),
+        "breakevens":     len(breakevens_list),
+        "win_rate":       round(len(wins_list) / max(decisive, 1) * 100, 1),
         "net_pnl":        round(net, 2),
         "roi":            round(net / start_balance * 100, 2),
-        "avg_win":        round(gw / max(len(wins), 1), 2),
-        "avg_loss":       round(gl / max(len(losses), 1), 2),   # positive magnitude
+        "avg_win":        round(gw / max(len(wins_list), 1), 2),
+        "avg_loss":       round(gl / max(len(losses_list), 1), 2),   # positive magnitude
         "profit_factor":  round(gw / max(gl, 0.01), 2),
         "trades_per_day": round(len(trades) / n_days, 1),
         "n_days":         n_days,

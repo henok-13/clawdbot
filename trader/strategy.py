@@ -102,25 +102,34 @@ def _check_breakout(m15: pd.DataFrame, direction: Direction, atr_val: float) -> 
     """
     Price has just closed beyond the most recent swing high (BUY) or
     swing low (SELL) by at least breakout_atr_mult * ATR.
+    The reference swing must be at least breakout_min_swing_age_bars old
+    to avoid triggering on the same bar the swing formed.
     """
-    is_sh, is_sl = swing_highs_lows(m15, lookback=8)
+    is_sh, is_sl = swing_highs_lows(m15, lookback=12)
+    min_age = cfg.breakout_min_swing_age_bars
 
     if direction == "BUY":
-        swing_highs = m15["high"][is_sh]
-        if swing_highs.empty:
+        # Only consider swings formed ≥ min_age bars ago
+        sh_series = is_sh.iloc[:-min_age] if len(is_sh) > min_age else is_sh
+        swing_highs_idx = sh_series[sh_series].index
+        if swing_highs_idx.empty:
             return False
-        last_swing_high = swing_highs.iloc[-1]
+        last_swing_idx = swing_highs_idx[-1]
+        last_swing_high = m15.loc[last_swing_idx, "high"]
         breakout_level = last_swing_high + cfg.breakout_atr_mult * atr_val
         result = m15["close"].iloc[-1] > breakout_level
-        logger.debug("Breakout BUY: close=%.2f vs level=%.2f → %s",
-                     m15["close"].iloc[-1], breakout_level, result)
+        logger.debug("Breakout BUY: close=%.2f vs level=%.2f (swing@%.2f + %.1f*ATR) → %s",
+                     m15["close"].iloc[-1], breakout_level, last_swing_high,
+                     cfg.breakout_atr_mult, result)
         return result
 
     # SELL
-    swing_lows = m15["low"][is_sl]
-    if swing_lows.empty:
+    sl_series = is_sl.iloc[:-min_age] if len(is_sl) > min_age else is_sl
+    swing_lows_idx = sl_series[sl_series].index
+    if swing_lows_idx.empty:
         return False
-    last_swing_low = swing_lows.iloc[-1]
+    last_swing_idx = swing_lows_idx[-1]
+    last_swing_low = m15.loc[last_swing_idx, "low"]
     breakout_level = last_swing_low - cfg.breakout_atr_mult * atr_val
     result = m15["close"].iloc[-1] < breakout_level
     logger.debug("Breakout SELL: close=%.2f vs level=%.2f → %s",
@@ -213,6 +222,12 @@ def evaluate(m15: pd.DataFrame, h1: pd.DataFrame) -> Optional[Signal]:
 
     # Composite strength: breakout/pullback contributes 0.5, momentum the rest
     strength = round(0.5 + mom_score * 0.5, 2)
+
+    # Reject weak signals — only trade high-conviction setups
+    if strength < cfg.min_signal_strength:
+        logger.debug("Signal strength %.2f below threshold %.2f — skipped",
+                     strength, cfg.min_signal_strength)
+        return None
 
     reason = (
         f"H1 trend={direction} | {entry_type} on M15 | "

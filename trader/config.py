@@ -55,21 +55,38 @@ class StrategyConfig:
     atr_period: int = 14
 
     # Breakout: price must exceed this many ATR multiples above swing high/low
-    breakout_atr_mult: float = 0.3
+    # Higher = fewer but cleaner breakout signals
+    breakout_atr_mult: float = 1.0
+
+    # Minimum bars since the reference swing high/low was formed
+    # Prevents entering on the very bar a swing is identified
+    breakout_min_swing_age_bars: int = 4
+
+    # Bars to wait after a trade entry before allowing another signal
+    signal_cooldown_bars: int = 16   # 4 hours on M15
 
     # Pullback: price retraces this fraction of the last swing before entry
     pullback_min_retrace: float = 0.30
     pullback_max_retrace: float = 0.65
 
+    # Only take signals above this composite strength
+    min_signal_strength: float = 0.75
+
 
 @dataclass
 class RiskConfig:
     # XAU/USD: 1 point = $0.01 price move; 800 points = $8.00 move
+    # These are the fixed fallback values; atr_based_risk overrides them when True
     take_profit_points: int = 800    # $8.00 move on spot price
     stop_loss_points: int = 500      # $5.00 move — conservative 1:1.6 R:R
 
+    # ATR-based dynamic SL/TP (preferred — adapts to current volatility)
+    atr_based_risk: bool = True
+    atr_sl_mult: float = 2.0        # SL = 2x ATR
+    atr_tp_mult: float = 3.5        # TP = 3.5x ATR → R:R ≈ 1:1.75
+
     max_risk_pct: float = 1.0        # max 1% of account equity per trade
-    max_open_trades: int = 2         # no more than 2 concurrent positions
+    max_open_trades: int = 1         # conservative: 1 position at a time
     daily_loss_limit_pct: float = 3.0  # halt trading if daily drawdown exceeds 3%
 
     # Minimum lot size Vantage allows; keep conservative

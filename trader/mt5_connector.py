@@ -4,7 +4,10 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-import MetaTrader5 as mt5
+try:
+    import MetaTrader5 as mt5
+except ImportError:
+    mt5 = None  # type: ignore[assignment]  # not available on Linux/macOS
 import pandas as pd
 
 from .config import mt5_cfg, strategy_cfg, risk_cfg

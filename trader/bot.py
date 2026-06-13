@@ -194,10 +194,14 @@ def _tick(symbol: str) -> None:
             rcfg.take_profit_points, rcfg.stop_loss_points,
         )
         # Push iPhone notification
-        import MetaTrader5 as mt5
-        tick = mt5.symbol_info_tick(symbol)
-        price = (tick.ask if sig.direction == "BUY" else tick.bid) if tick else 0.0
-        point = mt5.symbol_info(symbol).point if mt5.symbol_info(symbol) else 0.01
+        try:
+            import MetaTrader5 as _mt5
+            tick = _mt5.symbol_info_tick(symbol)
+            price = (tick.ask if sig.direction == "BUY" else tick.bid) if tick else 0.0
+            point = _mt5.symbol_info(symbol).point if _mt5.symbol_info(symbol) else 0.01
+        except ImportError:
+            price = 0.0
+            point = 0.01
         tp_price = price + rcfg.take_profit_points * point if sig.direction == "BUY" else price - rcfg.take_profit_points * point
         sl_price = price - rcfg.stop_loss_points * point if sig.direction == "BUY" else price + rcfg.stop_loss_points * point
         notify_trade_opened(

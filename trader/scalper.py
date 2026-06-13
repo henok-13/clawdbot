@@ -49,6 +49,8 @@ class ScalpParams:
     rsi_sell_max: float   = 48.0
     be_trigger_points: int = 50    # slide SL to entry once +50 pts in profit
     min_vol_ratio: float  = 0.90   # volume must be ≥ 90% of 20-bar average
+    daily_loss_limit: float = 200.0  # stop trading the day once this loss is hit
+    daily_profit_target: float = 500.0  # stop trading the day once this profit is hit
 
 
 def _build_h1_trend(m5: pd.DataFrame, h1: pd.DataFrame) -> np.ndarray:
@@ -156,6 +158,7 @@ def run_scalper(
     t_entry_date = None
 
     daily_counts: dict = {}
+    daily_pnl: dict = {}     # date -> running P&L for that day
     warmup = 300   # slightly longer for H1/H4 indicator warmup
 
     for i in range(warmup, n):
@@ -191,6 +194,7 @@ def run_scalper(
             if tp_hit:
                 pnl = params.tp_points * lot * PPL - spread_cost
                 balance += pnl
+                daily_pnl[t_entry_date] = daily_pnl.get(t_entry_date, 0.0) + pnl
                 trades.append({"pnl": round(pnl, 2), "result": "TP"})
                 in_trade = False
 
@@ -202,6 +206,7 @@ def run_scalper(
                     pnl    = -params.sl_points * lot * PPL - spread_cost
                     result = "SL"
                 balance += pnl
+                daily_pnl[t_entry_date] = daily_pnl.get(t_entry_date, 0.0) + pnl
                 trades.append({"pnl": round(pnl, 2), "result": result})
                 in_trade = False
 
@@ -209,6 +214,7 @@ def run_scalper(
                 pnl_pts = (c - t_entry) / POINT if t_dir == 1 else (t_entry - c) / POINT
                 pnl = pnl_pts * lot * PPL - spread_cost
                 balance += pnl
+                daily_pnl[t_entry_date] = daily_pnl.get(t_entry_date, 0.0) + pnl
                 trades.append({"pnl": round(pnl, 2), "result": "EOD"})
                 in_trade = False
 
@@ -221,6 +227,13 @@ def run_scalper(
 
         daily_count = daily_counts.get(bar_date, 0)
         if daily_count >= params.max_trades_day:
+            continue
+
+        # Daily loss / profit limits — halt entries for the rest of this day
+        day_pnl = daily_pnl.get(bar_date, 0.0)
+        if day_pnl <= -params.daily_loss_limit:
+            continue
+        if day_pnl >= params.daily_profit_target:
             continue
 
         # Layer 1 — H1 EMA trend direction

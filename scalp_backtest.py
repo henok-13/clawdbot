@@ -38,7 +38,9 @@ PARAMS = ScalpParams(
     rsi_buy_max    = 75.0,
     rsi_sell_min   = 25.0,
     rsi_sell_max   = 60.0,
-    be_trigger_points = 50,
+    be_trigger_points   = 50,
+    daily_loss_limit    = 200.0,
+    daily_profit_target = 500.0,
 )
 
 

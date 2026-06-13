@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Scalping backtest: TP=120pts, SL=60pts, target 40+ trades/day.
+Scalping backtest: TP=200pts, SL=135pts, target 40+ trades/day.
 Uses M5 data with H1 trend filter.
 
-XAU/USD lot size: 0.50
-  Win  → +120 pts × 0.50 lot × $1.00/pt − spread = +$60 − $2 = +$58 net
-  Loss → −60 pts × 0.50 lot × $1.00/pt − spread = −$30 − $2 = −$32 net
+XAU/USD lot size: 0.60
+  Win  → +200 pts × 0.60 lot × $1.00/pt − spread = +$120 − $2.40 = +$117.60 net
+  Loss → −135 pts × 0.60 lot × $1.00/pt − spread = −$81 − $2.40 = −$83.40 net
 """
 
 import sys
@@ -16,14 +16,14 @@ import pandas as pd
 from trader.synthetic_data import generate_xauusd
 from trader.scalper import ScalpParams, run_scalper
 
-LOT          = 0.50
+LOT          = 0.60
 START_BAL    = 10_000.0
 N_BARS       = 50_000   # ~8.5 months of M5 data (Mon-Fri, 12 bars/hour)
 SEEDS        = list(range(10))
 
 PARAMS = ScalpParams(
-    tp_points     = 120,
-    sl_points     = 60,
+    tp_points     = 200,
+    sl_points     = 135,
     max_trades_day= 60,
     session_open  = 7,
     session_close = 21,
@@ -46,7 +46,7 @@ def resample_to_h1(m5: pd.DataFrame) -> pd.DataFrame:
 
 def main() -> None:
     print("=" * 72)
-    print("  XAU/USD SCALPING BACKTEST  |  TP=120pts  SL=60pts  Lot=0.50")
+    print("  XAU/USD SCALPING BACKTEST  |  TP=200pts  SL=135pts  Lot=0.60")
     print("=" * 72)
     print(f"  Data: {N_BARS:,} M5 bars (~{N_BARS // (12*5*5):.0f} months)  "
           f"| Session: {PARAMS.session_open:02d}:00-{PARAMS.session_close:02d}:00 UTC  "

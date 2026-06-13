@@ -2,8 +2,8 @@
 High-frequency scalping backtest engine for XAU/USD.
 
 Strategy: Enter on M5 bars with H1 trend confirmation; exit at
-fixed TP (+120 pts) or SL (-60 pts). Target 40+ trades per day.
-Lot size: 0.50.
+fixed TP (+200 pts) or SL (-135 pts). Target 40+ trades per day.
+Lot size: 0.60.
 
 XAU/USD constants (matches rest of codebase):
   POINT = 0.01   (1 point = $0.01 price move)
@@ -25,8 +25,8 @@ PPL   = 100 * POINT   # $1.00 P&L per lot per point
 
 @dataclass
 class ScalpParams:
-    tp_points: int       = 120   # take profit in points
-    sl_points: int       = 60    # stop loss in points
+    tp_points: int       = 200   # take profit in points
+    sl_points: int       = 135   # stop loss in points
     max_trades_day: int  = 60    # hard daily cap
     session_open: int    = 7     # UTC hour (inclusive)
     session_close: int   = 21    # UTC hour (exclusive)

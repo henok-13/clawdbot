@@ -38,7 +38,7 @@ POLL_INTERVAL_SEC = 30
 # Daily manager — $500 profit target, $150 loss limit
 _daily = DailyManager(DailyManagerConfig(
     daily_profit_target=500.0,
-    daily_loss_limit=150.0,
+    daily_loss_limit=200.0,
     max_trades_per_day=3,
 ))
 

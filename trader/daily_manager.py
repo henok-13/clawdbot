@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class DailyManagerConfig:
     daily_profit_target: float  = 500.0   # stop trading once +$500 hit today
-    daily_loss_limit: float     = 150.0   # stop trading once -$150 hit today
+    daily_loss_limit: float     = 200.0   # stop trading once -$200 hit today
     max_trades_per_day: int     = 3        # hard cap — avoids overtrading on volatile days
     notify_on_target: bool      = True
 

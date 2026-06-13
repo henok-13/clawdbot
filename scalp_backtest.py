@@ -22,26 +22,41 @@ N_BARS       = 50_000   # ~8.5 months of M5 data (Mon-Fri, 12 bars/hour)
 SEEDS        = list(range(10))
 
 PARAMS = ScalpParams(
-    tp_points     = 200,
-    sl_points     = 135,
-    max_trades_day= 60,
-    session_open  = 7,
-    session_close = 21,
-    min_body_ratio= 0.25,
-    use_h1_trend  = True,
-    spread_points = 4,
+    tp_points      = 200,
+    sl_points      = 135,
+    max_trades_day = 60,
+    session_open   = 8,    # London open
+    session_close  = 18,   # NY mid-session (peak trending hours)
+    min_body_ratio = 0.38,
+    use_h1_trend   = True,
+    use_h1_rsi     = True,
+    use_h4_trend   = True,
+    spread_points  = 4,
+    adx_min        = 24.0,
+    h1_rsi_bull_min = 56.0,
+    h1_rsi_bear_max = 44.0,
+    rsi_buy_min    = 52.0,
+    rsi_buy_max    = 68.0,
+    rsi_sell_min   = 32.0,
+    rsi_sell_max   = 48.0,
+    be_trigger_points = 50,
+    min_vol_ratio  = 0.90,
 )
 
 
-def resample_to_h1(m5: pd.DataFrame) -> pd.DataFrame:
-    """Resample M5 bars to H1 via pandas — matches the codebase pattern."""
-    return m5.resample("1h").agg({
-        "open":   "first",
-        "high":   "max",
-        "low":    "min",
-        "close":  "last",
-        "volume": "sum",
+def _resample(m5: pd.DataFrame, rule: str) -> pd.DataFrame:
+    return m5.resample(rule).agg({
+        "open": "first", "high": "max", "low": "min",
+        "close": "last", "volume": "sum",
     }).dropna()
+
+
+def resample_to_h1(m5: pd.DataFrame) -> pd.DataFrame:
+    return _resample(m5, "1h")
+
+
+def resample_to_h4(m5: pd.DataFrame) -> pd.DataFrame:
+    return _resample(m5, "4h")
 
 
 def main() -> None:
@@ -49,7 +64,7 @@ def main() -> None:
     print("  XAU/USD SCALPING BACKTEST  |  TP=200pts  SL=135pts  Lot=0.60")
     print("=" * 72)
     print(f"  Data: {N_BARS:,} M5 bars (~{N_BARS // (12*5*5):.0f} months)  "
-          f"| Session: {PARAMS.session_open:02d}:00-{PARAMS.session_close:02d}:00 UTC  "
+          f"| Session: {PARAMS.session_open:02d}:00-{PARAMS.session_close:02d}:00 UTC (London+NY)  "
           f"| Spread: {PARAMS.spread_points}pts")
     print(f"  Win  → +${PARAMS.tp_points * LOT:.0f} − ${PARAMS.spread_points * LOT:.0f} = "
           f"+${PARAMS.tp_points * LOT - PARAMS.spread_points * LOT:.0f} net per trade")
@@ -61,7 +76,8 @@ def main() -> None:
     for seed in SEEDS:
         m5 = generate_xauusd(n_bars=N_BARS, timeframe_minutes=5, seed=seed)
         h1 = resample_to_h1(m5)
-        res = run_scalper(m5, h1, params=PARAMS, lot=LOT, start_balance=START_BAL)
+        h4 = resample_to_h4(m5)
+        res = run_scalper(m5, h1, h4, params=PARAMS, lot=LOT, start_balance=START_BAL)
         rows.append({
             "seed":       seed,
             **res,

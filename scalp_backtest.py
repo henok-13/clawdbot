@@ -25,22 +25,20 @@ PARAMS = ScalpParams(
     tp_points      = 200,
     sl_points      = 135,
     max_trades_day = 60,
-    session_open   = 8,    # London open
-    session_close  = 18,   # NY mid-session (peak trending hours)
-    min_body_ratio = 0.38,
-    use_h1_trend   = True,
-    use_h1_rsi     = True,
-    use_h4_trend   = True,
+    session_open   = 6,    # extended session for max frequency
+    session_close  = 22,
+    min_body_ratio = 0.15,  # minimal body filter
+    use_h1_trend   = True,  # keep H1 direction for edge
+    use_h1_rsi     = False, # disabled — too restrictive for frequency
+    use_h4_trend   = False, # disabled — too restrictive for frequency
     spread_points  = 4,
-    adx_min        = 24.0,
-    h1_rsi_bull_min = 56.0,
-    h1_rsi_bear_max = 44.0,
-    rsi_buy_min    = 52.0,
-    rsi_buy_max    = 68.0,
-    rsi_sell_min   = 32.0,
-    rsi_sell_max   = 48.0,
+    adx_min        = 0.0,   # disabled
+    min_vol_ratio  = 0.0,   # disabled
+    rsi_buy_min    = 40.0,  # wide RSI zones
+    rsi_buy_max    = 75.0,
+    rsi_sell_min   = 25.0,
+    rsi_sell_max   = 60.0,
     be_trigger_points = 50,
-    min_vol_ratio  = 0.90,
 )
 
 
@@ -61,7 +59,7 @@ def resample_to_h4(m5: pd.DataFrame) -> pd.DataFrame:
 
 def main() -> None:
     print("=" * 72)
-    print("  XAU/USD SCALPING BACKTEST  |  TP=200pts  SL=135pts  Lot=0.60")
+    print("  XAU/USD SCALPING BACKTEST  |  TP=200pts  SL=135pts  Lot=0.60  | HIGH-FREQ MODE")
     print("=" * 72)
     print(f"  Data: {N_BARS:,} M5 bars (~{N_BARS // (12*5*5):.0f} months)  "
           f"| Session: {PARAMS.session_open:02d}:00-{PARAMS.session_close:02d}:00 UTC (London+NY)  "

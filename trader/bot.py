@@ -198,8 +198,10 @@ def _tick(symbol: str) -> None:
         equity=equity,
         risk_pct=1.0,           # risk 1% of account per trade
         sl_points=sl_pts,
-        max_lot=rcfg.max_lot,   # hard cap at 0.30 (or whatever config says)
+        max_lot=rcfg.max_lot,   # hard cap at 0.50 lot
     )
+    # Override with fixed lot if dynamic sizing gives less than fixed
+    lot = max(lot, rcfg.fixed_lot)
 
     comment = f"xaubot-v3-{sig.entry_type[:2].lower()}"
     result = mt5c.place_order(

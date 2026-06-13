@@ -95,10 +95,10 @@ class RiskConfig:
     max_open_trades: int = 1         # conservative: 1 position at a time
     daily_loss_limit_pct: float = 3.0  # halt trading if daily drawdown exceeds 3%
 
-    # Fixed lot size (0.30 per trade as required)
-    fixed_lot: float = 0.30
+    # Fixed lot size (user-set: 0.50 lot per trade)
+    fixed_lot: float = 0.50
     min_lot: float = 0.01
-    max_lot: float = 0.30           # cap at 0.30 lot
+    max_lot: float = 0.50           # cap at 0.50 lot
 
     # Magic number to tag bot orders in MT5
     magic_number: int = 20240601

@@ -51,6 +51,11 @@ class ScalpParams:
     trail_atr_mult: float   = 0.8    # trail stop: 0.8 × ATR behind running extreme
     be_atr_mult: float      = 0.5    # slide SL to entry when 0.5 × ATR in profit
 
+    # ── Fixed dollar profit target ────────────────────────────────────────────
+    # When > 0, close the trade once unrealized P&L hits this amount in USD.
+    # Overrides atr_tp_mult; disables partial TP and BE in this mode.
+    dollar_tp: float = 0.0
+
     # ── Consecutive loss daily stop (Fix 7) ───────────────────────────────────
     max_consec_losses: int  = 3   # halt rest of day after 3 straight losses
 
@@ -411,20 +416,30 @@ def run_scalper(
         if entry <= 0:
             continue
 
-        # Fix 1: ATR-adaptive SL/TP (in price units)
+        # Compute SL price distance first (needed for lot sizing)
         sl_price_dist = atr_v * params.atr_sl_mult
-        tp_price_dist = atr_v * params.atr_tp_mult
-        partial_tp_dist = atr_v * params.partial_tp_mult
-        be_trigger_dist = atr_v * params.be_atr_mult
 
-        # Fix 3: Compound lot sizing
+        # Fix 3: Compound lot sizing (must come before TP calc when dollar_tp is used)
         if params.use_compound_sizing:
-            sl_pts_num = sl_price_dist / POINT   # SL distance in points count
-            risk_usd = balance * params.risk_pct
-            t_lot_val = min(risk_usd / max(sl_pts_num * PPL, 0.001), params.max_lot)
-            t_lot_val = max(round(t_lot_val, 2), 0.01)
+            sl_pts_num = sl_price_dist / POINT
+            risk_usd   = balance * params.risk_pct
+            t_lot_val  = min(risk_usd / max(sl_pts_num * PPL, 0.001), params.max_lot)
+            t_lot_val  = max(round(t_lot_val, 2), 0.01)
         else:
             t_lot_val = lot
+
+        # Fix 1: TP is either dollar-based or ATR-based
+        if params.dollar_tp > 0:
+            # Dollar TP: derive price distance from fixed dollar target and lot size
+            # Partial TP and BE are disabled — clean single exit at profit target
+            tp_pts_count    = params.dollar_tp / max(t_lot_val * PPL, 1e-9)
+            tp_price_dist   = tp_pts_count * POINT
+            partial_tp_dist = tp_price_dist * 100  # effectively disabled
+            be_trigger_dist = tp_price_dist * 100  # effectively disabled
+        else:
+            tp_price_dist   = atr_v * params.atr_tp_mult
+            partial_tp_dist = atr_v * params.partial_tp_mult
+            be_trigger_dist = atr_v * params.be_atr_mult
 
         if d == 1:
             t_tp        = entry + tp_price_dist

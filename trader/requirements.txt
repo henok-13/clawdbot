@@ -1,0 +1,9 @@
+# XAU/USD Trader Bot — Python dependencies
+# Install: pip install -r trader/requirements.txt
+
+MetaTrader5>=5.0.45          # MT5 Python bridge (Windows only at runtime)
+pandas>=2.0.0
+numpy>=1.26.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+flask>=3.0.0                 # iPhone web dashboard (--with-api flag)
